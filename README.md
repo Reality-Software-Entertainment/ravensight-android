@@ -9,9 +9,9 @@ side kill switch, in one Kotlin library with zero third party dependencies.
 * Docs: https://ravensight.io/docs/
 * minSdk 24 (Android 7.0), Kotlin only
 
-## BETA notice
+## Verification status
 
-This package is a beta. The protocol logic in the `core` module is written and
+The protocol logic in the `core` module is written and
 reviewed against the live API contract, and it is deliberately free of any
 Android dependency so it is covered by plain JVM unit tests. It has **not**
 yet been verified inside a device or emulator build.
