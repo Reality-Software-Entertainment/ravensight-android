@@ -7,6 +7,7 @@ side kill switch, in one Kotlin library with zero third party dependencies.
 
 * API base: `https://api.ravensight.io/api/v1`
 * Docs: https://ravensight.io/docs/
+* Privacy: a random per-install device id, no advertising identifier, a local opt-out (`Ravensight.setEnabled(false)`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * minSdk 24 (Android 7.0), Kotlin only
 
 ## Verification status
@@ -195,6 +196,16 @@ itself. Only the events you choose to send leave the device.
 
 `Ravensight.setEnabled(false)` stops all sending and discards anything still
 queued, so an opt out does not leave player data sitting in memory.
+
+The opt-out is not stored by the SDK: keep the player's choice in your own
+settings and call `Ravensight.setEnabled(false)` before the first event on every
+launch. To forget this install's analytics identity, remove `ravensight/device_id` from `SharedPreferences`;
+the next run starts under a fresh id and nothing links the old one back.
+
+A game that sends gameplay events and nothing else can declare Device ID and
+Product Interaction as not linked to the player and not used for tracking,
+and needs no tracking permission prompt. The row by row answers for the App
+Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
 
 ## License
 
