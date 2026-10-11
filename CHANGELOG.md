@@ -78,6 +78,17 @@ Pre-1.0, so this minor version contains breaking changes.
   every batch behind it.
 * No exception inside the SDK can reach the worker looper.
 * Suggestions and feedback make no request while tracking is off.
+* After 30 minutes in the background, `game_exited` is one request on the old
+  session, sent after that session's leftovers; if it fails it is dropped,
+  never sent on the new session.
+* `game_started` goes first in the queue, ahead of events tracked before the
+  first foreground.
+* A settings `429`, or `503` with `Retry-After`, waits and checks again
+  (`rate_limited`).
+* `maxQueueSize` and `maxBatchSize` below 1 are treated as 1.
+* Event data is serialized inside `track()` on the caller's thread; data that
+  cannot be serialized makes `track()` return false instead of blocking the
+  queue.
 
 ## [0.1.0]
 

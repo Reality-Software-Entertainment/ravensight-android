@@ -452,8 +452,21 @@ object Ravensight {
             }
             if (!active) return false
             val at = clock() / 1000L
-            // Copy so later mutation of the caller's map cannot race the worker.
-            val snapshot = if (data.isEmpty()) emptyMap() else HashMap(data)
+            // Serialize here, on the caller's thread, into plain JSON values:
+            // later mutation of the caller's map cannot race the worker, and a
+            // value that cannot be serialized fails this call instead of
+            // blocking every batch behind it.
+            val snapshot: Map<String, Any?> = if (data.isEmpty()) {
+                emptyMap()
+            } else {
+                try {
+                    @Suppress("UNCHECKED_CAST")
+                    RavensightJson.toPlain(RavensightJson.toJsonObject(HashMap(data))) as Map<String, Any?>
+                } catch (t: Throwable) {
+                    Log.w(TAG, "event $eventName dropped: its data could not be serialized ($t)")
+                    return false
+                }
+            }
             checkReservedKeys(eventName, snapshot)
             post("track") {
                 core.track(eventName, snapshot, at)
@@ -653,8 +666,18 @@ object Ravensight {
         private fun endSessionAfterBackground(backgroundedAt: Long) {
             if (config.trackLifecycleEvents && !exitedQueued && core.isActive && core.isSessionValid()) {
                 exitedQueued = true
-                core.track("game_exited", emptyMap(), backgroundedAt / 1000L)
+                // The old session's own leftovers first, then its exit.
                 drainBatchesNow()
+                val token = core.sessionToken
+                if (token != null && core.isActive && effectiveEnabled() && core.retryInMs == 0L) {
+                    val result = postGameExited(token, backgroundedAt)
+                    if (result.status != 202) verbose("game_exited for the old session answered HTTP ${result.status}, dropped")
+                    if (result.status == 403) {
+                        val reason = RavensightReason.forRefusal(403, result.errorCode("")) ?: RavensightReason.INVALID_KEY
+                        core.onRefused(reason)
+                        handleRefusal(reason)
+                    }
+                }
             }
             core.invalidateSession()
             startedQueued = false
@@ -664,7 +687,9 @@ object Ravensight {
         private fun queueGameStarted(now: Long) {
             if (!config.trackLifecycleEvents || startedQueued || !foregrounded || !core.isActive) return
             startedQueued = true
-            core.track("game_started", emptyMap(), now / 1000L)
+            // First in the queue, so nothing tracked before the foreground
+            // (a push handler, say) lands ahead of the session's start.
+            core.track("game_started", emptyMap(), now / 1000L, atHead = true)
         }
 
         private fun applyEnabled() {
@@ -734,13 +759,22 @@ object Ravensight {
             if (token == null) return
             deleteMarker()
             if (token.isEmpty() || isPlaytest || !core.isActive || now >= expiresAt || backgroundedAt <= 0L) return
+            val result = postGameExited(token, backgroundedAt)
+            verbose("last launch's game_exited answered HTTP ${result.status}")
+        }
+
+        /**
+         * One POST of game_exited on [token], outside the queue, so it can
+         * never move to another session. One attempt; the caller drops it
+         * whatever the answer.
+         */
+        private fun postGameExited(token: String, backgroundedAt: Long): HttpResult {
             val event = JSONObject()
                 .put("event", "game_exited")
                 .put("data", JSONObject())
                 .put("timestamp", backgroundedAt / 1000L)
             val body = JSONObject().put("events", JSONArray().put(event))
-            val result = transport.request("POST", "$apiUrl/track/batch", headers("X-Session-Token" to token), body.toString())
-            verbose("last launch's game_exited answered HTTP ${result.status}")
+            return transport.request("POST", "$apiUrl/track/batch", headers("X-Session-Token" to token), body.toString())
         }
 
         // --- The driver loop, worker thread only ---------------------------------
@@ -772,6 +806,10 @@ object Ravensight {
         /** Sends batches on the current session right now, without opening a new one. */
         private fun drainBatchesNow() {
             repeat(MAX_DRAIN_STEPS) {
+                if (!effectiveEnabled()) {
+                    core.setEnabled(false)
+                    return
+                }
                 val action = core.nextAction() as? RavensightAction.SendBatch ?: return
                 sendBatch(action.events)
             }
@@ -789,10 +827,12 @@ object Ravensight {
             val value = result.json?.takeIf { it.has("trackingEnabled") }?.optBoolean("trackingEnabled")
             val errorCode = result.errorCode("")
             val refusal = RavensightReason.forRefusal(result.status, errorCode)
-            core.onSettingsResult(result.status, value, errorCode)
+            core.onSettingsResult(result.status, value, errorCode, result.retryAfterSec)
             when {
                 refusal != null -> handleRefusal(refusal)
                 !core.trackingEnabled -> handleRefusal(RavensightReason.TRACKING_DISABLED)
+                core.reason == RavensightReason.RATE_LIMITED && result.status != 200 ->
+                    verbose("settings check rate limited (HTTP ${result.status}), waiting")
                 result.status != 200 ->
                     verbose("settings check failed (HTTP ${result.status}), assuming tracking enabled")
             }

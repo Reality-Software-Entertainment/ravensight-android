@@ -8,7 +8,7 @@ server side kill switch, in one Kotlin library whose only dependency is
 
 * API base: `https://api.ravensight.io` (`/api/v1` is appended for you)
 * Docs: https://ravensight.io/docs/
-* Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(context, false)`), a reset (`Ravensight.resetDeviceId()`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
+* Privacy: a random device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(context, false)`), a reset (`Ravensight.resetDeviceId()`), no tracking permission prompt needed. The id is per install, and the saved opt-out stays on this device, once you merge the Auto Backup rules (see "Device id, privacy and Auto Backup"). What your store label can say: https://ravensight.io/docs/#privacy-label
 * minSdk 24 (Android 7.0), Kotlin only
 
 ## Verification status
@@ -134,9 +134,12 @@ blocking, safe from any thread, and never throws.
 | `Ravensight.setPlaytestContext(token, runId)` | Marks the run as a playtest run, if nothing else has. |
 | `Ravensight.setListener(listener)` | Replaces the listener at any time. |
 
-Event values can be strings, numbers, booleans, nulls, nested maps or lists.
-They are serialized with the platform's bundled `org.json`. A NaN or infinite
-number is sent as `null`.
+Event values can be strings, numbers, booleans, nulls, nested maps or lists;
+anything else is sent as its `toString()`. They are serialized with the
+platform's bundled `org.json` inside `track()`, on the calling thread, so
+later changes to your map do not affect the event, and data that cannot be
+serialized (a map that contains itself, say) makes `track()` return false
+with a warning. A NaN or infinite number is sent as `null`.
 
 One background `HandlerThread` owns the queue and the network, and listener
 callbacks are delivered on the main thread.
@@ -172,7 +175,7 @@ Rotate it from the dashboard at any time.
 The SDK sends exactly two automatic events, and only while tracking is on:
 
 * **`game_started`**, once per session, stamped at the moment the app came to
-  the foreground and queued at that moment. A process started in the
+  the foreground and put first in the queue. A process started in the
   background (a push message, a broadcast, a scheduled job) sends nothing and
   opens no session until the app first comes to the foreground. A game that
   starts switched off and is enabled later in the run sends it then, once.
@@ -189,7 +192,8 @@ session ends by time in the background, through `ProcessLifecycleOwner`
 * **Coming back within 30 minutes** (`sessionTimeoutMs`) continues the same
   session, and nothing is sent.
 * **Coming back after 30 minutes or more** sends `game_exited`, stamped with
-  the background time, on the old session, then starts a new session with a
+  the background time, once on the old session (if that request fails it is
+  dropped, never moved to the new session), then starts a new session with a
   new `game_started`.
 * **A cold launch after the player swiped the app away** finds the marker and
   sends that session's `game_exited` once, before anything else, if the
@@ -228,7 +232,7 @@ is called whenever it changes.
 | `invalid_key` | A `401`, or a `403` other than the ones below, from any endpoint. | Logs one warning, `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` Events keep queueing (the cap applies); automatic sending stops; `flush()` makes one more attempt. |
 | `tracking_disabled` | The kill switch is on for your game (`GET /settings` or a `403 tracking_disabled`). | Clears the queue and sends nothing more this run. `onTrackingDisabled("server")`. |
 | `offline` | The network was unreachable or timed out, or a batch answered `5xx`. | Keeps events and retries after 10 seconds, doubling to 5 minutes. |
-| `rate_limited` | `429`, or `503` with `Retry-After`. | Waits exactly `Retry-After`, then retries. |
+| `rate_limited` | `429`, or `503` with `Retry-After`, from the settings check, the session or a batch. | Waits exactly `Retry-After`, then retries. |
 | `session_failed` | Opening a session failed another way, or a playtest token was refused or arrived without a run id. | Retries with backoff; a playtest refusal stops the run. |
 | `playtest_job_closed` | The playtest job this run belongs to has closed. | Clears the queue and sends nothing more this run. |
 
@@ -407,7 +411,7 @@ surprise.
 You need JDK 17 and an Android SDK with platform 35 (`ANDROID_HOME`, or
 `sdk.dir` in `local.properties`). The first Robolectric run downloads the
 Android runtime it simulates. No device or emulator is needed. CI runs all
-three on every push.
+three on pushes to `main` and on pull requests.
 
 ## License
 

@@ -625,6 +625,54 @@ class RavensightCoreTest {
     }
 
     @Test
+    fun `settings 429 waits Retry-After then checks again`() {
+        val c = core()
+        assertTrue(c.nextAction() is RavensightAction.CheckSettings)
+        c.onSettingsResult(429, null, "rate_limited", retryAfterSec = 30L)
+        assertEquals(RavensightReason.RATE_LIMITED, c.reason)
+        assertTrue(c.nextAction() is RavensightAction.WaitUntil)
+        assertEquals(30_000L, c.retryInMs)
+        now += 30_000L
+        assertTrue(c.nextAction() is RavensightAction.CheckSettings)
+    }
+
+    @Test
+    fun `settings 503 with Retry-After waits, without it assumes enabled`() {
+        val c = core()
+        c.onSettingsResult(503, null, "storage_unavailable", retryAfterSec = 60L)
+        assertTrue(c.nextAction() is RavensightAction.WaitUntil)
+        val c2 = core()
+        c2.onSettingsResult(503, null)
+        c2.track("e")
+        assertTrue(c2.nextAction() is RavensightAction.OpenSession)
+    }
+
+    @Test
+    fun `a queue cap below one is clamped to one`() {
+        val c = core(RavensightCoreConfig(maxQueueSize = 0, maxBatchSize = 0))
+        assertTrue(c.track("a"))
+        assertTrue(c.track("b"))
+        assertEquals(1, c.queueSize)
+        c.onSettingsResult(200, true)
+        c.nextAction()
+        c.onSessionResult(201, "tok")
+        val batch = c.nextAction() as RavensightAction.SendBatch
+        assertEquals(listOf("b"), batch.events.map { it.name })
+    }
+
+    @Test
+    fun `atHead puts an event first`() {
+        val c = core()
+        c.track("early")
+        c.track("game_started", atHead = true)
+        c.onSettingsResult(200, true)
+        c.nextAction()
+        c.onSessionResult(201, "tok")
+        val batch = c.nextAction() as RavensightAction.SendBatch
+        assertEquals(listOf("game_started", "early"), batch.events.map { it.name })
+    }
+
+    @Test
     fun `stopForRun clears the queue and idles`() {
         val c = core()
         c.track("e")

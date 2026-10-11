@@ -162,6 +162,8 @@ class RavensightCore(
     private val nowMs: () -> Long,
 ) {
     private val queue = ArrayDeque<RavensightEvent>()
+    private val queueCap = config.maxQueueSize.coerceAtLeast(1)
+    private val maxBatch = config.maxBatchSize.coerceAtLeast(1)
 
     private var settingsChecked = false
     private var enabledLocally = true
@@ -180,7 +182,7 @@ class RavensightCore(
     private var wantSession = false
     private var backoffMs = config.initialRetryMs
     private var nextAttemptAtMs = 0L
-    private var batchLimit = config.maxBatchSize
+    private var batchLimit = maxBatch
     private var consecutiveAuthFailures = 0
     private var inFlightBatchSize = 0
 
@@ -254,21 +256,27 @@ class RavensightCore(
     /**
      * Queues an event, dropping the oldest queued event first once the queue
      * cap is reached so the newest always survive. Safe to call before the
-     * settings check has answered. Returns false when tracking is off.
+     * settings check has answered. [timestampSec] is when the event
+     * happened, in Unix seconds; null means now. [atHead] puts the event
+     * first in the queue (used for game_started, which opens a session).
+     * Returns false when tracking is off, and never throws: a blank name
+     * also returns false.
      */
-    /**
-     * [timestampSec] is when the event happened, in Unix seconds; null means
-     * now. Returns false, and never throws, for a blank name.
-     */
-    fun track(name: String, data: Map<String, Any?> = emptyMap(), timestampSec: Long? = null): Boolean {
+    fun track(
+        name: String,
+        data: Map<String, Any?> = emptyMap(),
+        timestampSec: Long? = null,
+        atHead: Boolean = false,
+    ): Boolean {
         if (name.isBlank()) return false
         if (!isActive) return false
 
-        while (queue.size >= config.maxQueueSize) {
+        while (queue.size >= queueCap) {
             queue.removeFirst()
             dropped++
         }
-        queue.addLast(RavensightEvent(name, data, timestampSec ?: (nowMs() / 1000L)))
+        val event = RavensightEvent(name, data, timestampSec ?: (nowMs() / 1000L))
+        if (atHead) queue.addFirst(event) else queue.addLast(event)
         return true
     }
 
@@ -340,10 +348,10 @@ class RavensightCore(
     fun nextAction(): RavensightAction {
         if (!enabledLocally || stopReason != null || keyRefused) return RavensightAction.Idle
         if (!trackingEnabled) return RavensightAction.Idle
-        if (!settingsChecked) return RavensightAction.CheckSettings
 
         val now = nowMs()
         if (now < nextAttemptAtMs) return RavensightAction.WaitUntil(nextAttemptAtMs)
+        if (!settingsChecked) return RavensightAction.CheckSettings
 
         if (!isSessionValid()) {
             return if (queue.isNotEmpty() || wantSession) {
@@ -365,15 +373,27 @@ class RavensightCore(
     /**
      * Feed back the GET /settings response. [status] is the HTTP status, or 0
      * for a network failure. A 401 or 403 is a refusal ([onRefused]); the
-     * settings check is then repeated on the next allowed attempt. Any other
+     * settings check is then repeated on the next allowed attempt. A 429, or
+     * a 503 with [retryAfterSec], waits that long and checks again. Any other
      * unreachable or malformed answer assumes tracking is on, so a settings
      * outage never silently loses a session. Returns the resulting kill
      * switch state.
      */
-    fun onSettingsResult(status: Int, trackingEnabledValue: Boolean?, errorCode: String? = null): Boolean {
+    fun onSettingsResult(
+        status: Int,
+        trackingEnabledValue: Boolean?,
+        errorCode: String? = null,
+        retryAfterSec: Long? = null,
+    ): Boolean {
         val refusal = RavensightReason.forRefusal(status, errorCode)
         if (refusal != null) {
             onRefused(refusal)
+            return trackingEnabled
+        }
+        if (status == 429 || (status == 503 && retryAfterSec != null)) {
+            // Asked to slow down: check the settings again once the wait is over.
+            lastFailure = RavensightReason.RATE_LIMITED
+            scheduleRetry(retryAfterSec?.let { it * 1000L })
             return trackingEnabled
         }
         settingsChecked = true
@@ -455,7 +475,7 @@ class RavensightCore(
                 repeat(removed) { queue.removeFirst() }
                 sent += removed
                 flushes++
-                batchLimit = config.maxBatchSize
+                batchLimit = maxBatch
                 consecutiveAuthFailures = 0
                 lastFailure = null
                 resetBackoff()
@@ -495,7 +515,7 @@ class RavensightCore(
                     queue.removeFirst()
                     dropped++
                 }
-                batchLimit = config.maxBatchSize
+                batchLimit = maxBatch
                 return BatchOutcome.EventRejected
             }
 

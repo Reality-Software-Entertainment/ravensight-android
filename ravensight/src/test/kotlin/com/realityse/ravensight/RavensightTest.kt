@@ -298,7 +298,8 @@ class RavensightTest {
         assertEquals(0, http.requests.size)
         foreground()
         assertEquals(listOf("/settings", "/session", "/track/batch"), http.paths())
-        assertEquals(listOf("from_a_push_handler", "game_started"), eventNames())
+        // game_started opens the session, ahead of anything tracked before the foreground.
+        assertEquals(listOf("game_started", "from_a_push_handler"), eventNames())
     }
 
     @Test
@@ -359,6 +360,112 @@ class RavensightTest {
         assertEquals("game_started", started.getString("event"))
         assertEquals(now / 1000, started.getLong("timestamp"))
         assertFalse(prefs().contains(Ravensight.KEY_MARKER_TOKEN))
+    }
+
+    @Test
+    fun `a failed game_exited after the rollover is dropped, never sent on the new session`() {
+        init()
+        foreground()
+        http.requests.clear()
+        background()
+        advance(31 * 60_000L)
+        http.failTokenOnce = "tok_1" // the old session's exit answers status 0
+        foreground()
+        advance(10 * 60_000L)
+        val exitedOnOld = http.requests.filter {
+            it.path == "/track/batch" && it.headers["X-Session-Token"] == "tok_1"
+        }
+        assertEquals(1, exitedOnOld.size)
+        val onNew = http.requests.filter { it.path == "/track/batch" && it.headers["X-Session-Token"] != "tok_1" }
+        assertTrue(onNew.isNotEmpty())
+        for (req in onNew) assertFalse(req.body!!.contains("game_exited"))
+        assertEquals(listOf("game_exited", "game_started"), eventNames()) // the exit once, on tok_1 only
+    }
+
+    @Test
+    fun `the old session's leftovers go out before its game_exited`() {
+        init()
+        foreground()
+        background()
+        http.requests.clear()
+        http.batchStatus = 500
+        Ravensight.track("late") // fails once while backgrounded
+        Ravensight.flush()
+        worker.runDue()
+        http.batchStatus = 202
+        advance(31 * 60_000L)
+        foreground()
+        val onOld = http.requests.filter { it.headers["X-Session-Token"] == "tok_1" }.map {
+            JSONObject(it.body!!).getJSONArray("events").getJSONObject(0).getString("event")
+        }
+        assertEquals("game_exited", onOld.last())
+        assertTrue(http.requests.filter { it.headers["X-Session-Token"] == "tok_2" }.none { it.body!!.contains("game_exited") })
+    }
+
+    @Test
+    fun `an opt-out right before the rollover foreground sends nothing`() {
+        init()
+        foreground()
+        background()
+        http.requests.clear()
+        advance(31 * 60_000L)
+        controller.onForegroundSignal()
+        Ravensight.setTrackingEnabled(app, false)
+        worker.runDue()
+        advance(60_000)
+        assertEquals(0, http.requests.size)
+    }
+
+    @Test
+    fun `a settings 429 waits Retry-After and checks again`() {
+        http.settingsStatus = 429
+        http.retryAfter = "30"
+        init()
+        foreground()
+        assertEquals(listOf("/settings"), http.paths())
+        assertEquals("rate_limited", Ravensight.statusReason)
+        http.settingsStatus = 200
+        http.retryAfter = null
+        advance(29_999)
+        assertEquals(1, http.requests.size)
+        advance(1)
+        assertEquals(listOf("/settings", "/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(null, Ravensight.statusReason)
+    }
+
+    @Test
+    fun `data that cannot be serialized fails track on the caller and blocks nothing`() {
+        init()
+        foreground()
+        http.requests.clear()
+        val loop = HashMap<String, Any?>()
+        loop["self"] = loop
+        val bad = object {
+            override fun toString(): String = throw IllegalStateException("poison")
+        }
+        assertFalse(Ravensight.track("loop", loop))
+        assertFalse(Ravensight.track("bad", mapOf("v" to bad)))
+        assertTrue(Ravensight.track("fine", mapOf("v" to 1)))
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals(listOf("fine"), eventNames())
+    }
+
+    @Test
+    fun `event data is copied when tracked`() {
+        init()
+        foreground()
+        http.requests.clear()
+        val data = hashMapOf<String, Any?>("score" to 1, "tags" to mutableListOf("a"))
+        Ravensight.track("e", data)
+        data["score"] = 2
+        @Suppress("UNCHECKED_CAST")
+        (data["tags"] as MutableList<String>).add("b")
+        Ravensight.flush()
+        worker.runDue()
+        val sent = batchEvents().single().getJSONObject("data")
+        assertEquals(1, sent.getInt("score"))
+        assertEquals(1, sent.getJSONArray("tags").length())
     }
 
     @Test
@@ -872,7 +979,7 @@ internal class FakeTransport : RavensightTransport {
             "/settings" -> if (settingsStatus == 200) {
                 HttpResult(200, "{\"trackingEnabled\":$trackingEnabled}", null)
             } else {
-                HttpResult(settingsStatus, "{\"error\":\"invalid_api_key\"}", null)
+                HttpResult(settingsStatus, "{\"error\":\"invalid_api_key\"}", retryAfter)
             }
             "/session" -> if (sessionStatus == 201) {
                 sessions++
