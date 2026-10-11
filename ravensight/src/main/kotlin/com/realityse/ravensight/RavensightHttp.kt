@@ -1,6 +1,5 @@
 package com.realityse.ravensight
 
-import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -30,14 +29,20 @@ internal class HttpResult(
         json?.optString("error")?.takeIf { it.isNotEmpty() } ?: fallback
 }
 
+/** One blocking HTTP exchange. Swapped for a fake in the unit tests. */
+internal fun interface RavensightTransport {
+    /** Never throws: network failures come back as status 0. */
+    fun request(method: String, url: String, headers: Map<String, String>, body: String?): HttpResult
+}
+
 /**
  * Blocking JSON-over-HTTP on HttpURLConnection. No third party dependencies.
  * Only ever called from the SDK's single worker thread.
  */
-internal class RavensightHttp(private val timeoutMs: Int) {
+internal class RavensightHttp(private val timeoutMs: Int) : RavensightTransport {
 
-    /** Never throws: network failures come back as status 0. */
-    fun request(method: String, url: String, headers: Map<String, String>, body: String?): HttpResult {
+    /** Never throws: network failures, and anything else that goes wrong, come back as status 0. */
+    override fun request(method: String, url: String, headers: Map<String, String>, body: String?): HttpResult {
         var connection: HttpURLConnection? = null
         return try {
             connection = URL(url).openConnection() as HttpURLConnection
@@ -45,6 +50,7 @@ internal class RavensightHttp(private val timeoutMs: Int) {
             connection.connectTimeout = timeoutMs
             connection.readTimeout = timeoutMs
             connection.useCaches = false
+            connection.setRequestProperty("User-Agent", "ravensight-android/${Ravensight.VERSION}")
             for ((name, value) in headers) connection.setRequestProperty(name, value)
 
             if (body != null) {
@@ -57,7 +63,7 @@ internal class RavensightHttp(private val timeoutMs: Int) {
             val stream = if (status in 200..299) connection.inputStream else connection.errorStream
             val text = stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() } ?: ""
             HttpResult(status, text, connection.getHeaderField("Retry-After"))
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             HttpResult(0, "", null)
         } finally {
             connection?.disconnect()
@@ -77,6 +83,9 @@ internal object RavensightJson {
             for (v in value) arr.put(toJsonValue(v))
         }
         is Array<*> -> toJsonValue(value.asList())
+        // org.json refuses NaN and infinities by throwing; send null instead.
+        is Double -> if (value.isFinite()) value else JSONObject.NULL
+        is Float -> if (value.isFinite()) value else JSONObject.NULL
         is Boolean, is Number, is String -> value
         else -> value.toString()
     }

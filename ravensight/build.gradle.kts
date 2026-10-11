@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.github.Reality-Software-Entertainment.ravensight-android"
-version = "0.1.0"
+version = "0.2.0"
 
 android {
     namespace = "com.realityse.ravensight"
@@ -21,6 +21,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+
     publishing {
         singleVariant("release") {
             withSourcesJar()
@@ -34,6 +38,11 @@ kotlin {
 
 dependencies {
     api(project(":core"))
+    implementation("androidx.lifecycle:lifecycle-process:2.8.7")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test:core:1.6.1")
 }
 
 publishing {
