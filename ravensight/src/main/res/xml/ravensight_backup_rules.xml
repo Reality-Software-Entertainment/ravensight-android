@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Auto Backup rules for Android 11 and below (android:fullBackupContent).
+    Keeps the Ravensight device id, the player's opt-out and the exit marker
+    out of backups, so the id is per install and never follows a player to a
+    new phone or across a reinstall. Copy the exclude line into your own
+    rules file if you already have one.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="ravensight.xml" />
+</full-backup-content>
