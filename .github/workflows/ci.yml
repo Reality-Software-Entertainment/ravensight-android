@@ -21,6 +21,9 @@ jobs:
       - name: JVM tests for the protocol core
         run: ./gradlew :core:test
 
+      - name: Robolectric tests for the Android layer
+        run: ./gradlew :ravensight:testDebugUnitTest
+
       - name: Assemble the Android library
         run: ./gradlew :ravensight:assembleRelease
 
@@ -28,5 +31,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: core-test-results
-          path: core/build/reports/tests/test
+          name: test-results
+          path: |
+            core/build/reports/tests/test
+            ravensight/build/reports/tests/testDebugUnitTest
