@@ -669,7 +669,7 @@ object Ravensight {
                 // The old session's own leftovers first, then its exit.
                 drainBatchesNow()
                 val token = core.sessionToken
-                if (token != null && core.isActive && effectiveEnabled() && core.retryInMs == 0L) {
+                if (token != null && core.isActive && !core.keyRefused && effectiveEnabled() && core.retryInMs == 0L) {
                     val result = postGameExited(token, backgroundedAt)
                     if (result.status != 202) verbose("game_exited for the old session answered HTTP ${result.status}, dropped")
                     if (result.status == 403) {
@@ -758,7 +758,7 @@ object Ravensight {
             val backgroundedAt = prefs.getLong(KEY_MARKER_BACKGROUNDED_AT, 0L)
             if (token == null) return
             deleteMarker()
-            if (token.isEmpty() || isPlaytest || !core.isActive || now >= expiresAt || backgroundedAt <= 0L) return
+            if (token.isEmpty() || isPlaytest || !core.isActive || core.keyRefused || now >= expiresAt || backgroundedAt <= 0L) return
             val result = postGameExited(token, backgroundedAt)
             verbose("last launch's game_exited answered HTTP ${result.status}")
         }

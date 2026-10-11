@@ -15,7 +15,7 @@ server side kill switch, in one Kotlin library whose only dependency is
 
 Tested with `./gradlew :core:test :ravensight:testDebugUnitTest :ravensight:assembleRelease`
 on JDK 17.0.19 and Gradle 8.10.2: 51 plain JVM tests drive the protocol core,
-and 51 Robolectric 4.14.1 tests (Android API 34 runtime) drive the Android
+and 52 Robolectric 4.14.1 tests (Android API 34 runtime) drive the Android
 layer with a fake transport, a fake clock and a manual worker queue.
 
 It has **not** yet been verified on a device or an emulator, and the real
@@ -372,7 +372,9 @@ playtested needs this inside `<application>`:
 
 Without it, a release build ignores the extras, logs one warning and runs as
 an ordinary player build that respects the saved opt-out. Leave it out of the
-build you ship to players.
+build you ship to players. The gate reads the `android:debuggable` flag, so a
+build shipped with `android:debuggable="true"` is treated as a debug build
+and honours the extras.
 
 In a playtest run the device id is `pt-<runId>`, held in memory and never
 saved; every request carries the `X-Ravensight-Playtest` header; the

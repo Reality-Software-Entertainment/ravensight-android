@@ -383,6 +383,27 @@ class RavensightTest {
     }
 
     @Test
+    fun `a refused key sends no exit POST on the rollover`() {
+        init()
+        foreground()
+        background()
+        http.requests.clear()
+        // A batch on the old session is answered 403: the key is refused.
+        http.batchStatus = 403
+        Ravensight.track("e")
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals("invalid_key", Ravensight.statusReason)
+        http.batchStatus = 202
+        http.requests.clear()
+        advance(31 * 60_000L)
+        foreground()
+        advance(10 * 60_000L)
+        assertTrue(http.requests.none { it.body?.contains("game_exited") == true })
+        assertEquals(0, http.requests.size)
+    }
+
+    @Test
     fun `the old session's leftovers go out before its game_exited`() {
         init()
         foreground()
