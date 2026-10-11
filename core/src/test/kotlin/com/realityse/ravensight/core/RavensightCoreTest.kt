@@ -463,15 +463,175 @@ class RavensightCoreTest {
     }
 
     @Test
-    fun `track rejects an empty name`() {
+    fun `track returns false for an empty or blank name and never throws`() {
         val c = core()
-        var threw = false
-        try {
-            c.track("")
-        } catch (e: IllegalArgumentException) {
-            threw = true
-        }
-        assertTrue(threw)
+        assertFalse(c.track(""))
+        assertFalse(c.track("   "))
+        assertEquals(0, c.queueSize)
+    }
+
+    @Test
+    fun `track takes an explicit timestamp`() {
+        val c = core()
+        c.track("game_exited", timestampSec = 123L)
+        c.onSettingsResult(200, true)
+        c.nextAction()
+        c.onSessionResult(201, "tok")
+        val batch = c.nextAction() as RavensightAction.SendBatch
+        assertEquals(123L, batch.events[0].timestampSec)
+    }
+
+    // --- Refusals and the reason vocabulary --------------------------------
+
+    @Test
+    fun `settings 401 makes one request then none and keeps the queue`() {
+        val c = core()
+        c.track("early")
+        assertTrue(c.nextAction() is RavensightAction.CheckSettings)
+        c.onSettingsResult(401, null, "invalid_api_key")
+        assertTrue(c.keyRefused)
+        assertEquals(RavensightReason.INVALID_KEY, c.reason)
+        repeat(3) { now += 600_000L; assertTrue(c.nextAction() is RavensightAction.Idle) }
+        // Events keep queueing while the key is refused.
+        assertTrue(c.track("later"))
+        assertEquals(2, c.queueSize)
+    }
+
+    @Test
+    fun `an explicit retry after a refused key makes exactly one more attempt`() {
+        val c = core()
+        c.track("e")
+        c.nextAction()
+        c.onSettingsResult(401, null)
+        c.retryOnce()
+        assertTrue(c.nextAction() is RavensightAction.CheckSettings)
+        c.onSettingsResult(401, null)
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+    }
+
+    @Test
+    fun `session 401 is a refused key, not a retry loop`() {
+        val c = core()
+        c.onSettingsResult(200, true)
+        c.track("e")
+        assertTrue(c.nextAction() is RavensightAction.OpenSession)
+        val outcome = c.onSessionResult(401, null, errorCode = "invalid_api_key")
+        assertTrue(outcome is SessionOutcome.Refused)
+        assertEquals(RavensightReason.INVALID_KEY, (outcome as SessionOutcome.Refused).reason)
+        now += 3_600_000L
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+        assertEquals(1, c.queueSize)
+    }
+
+    @Test
+    fun `a 403 with another error code is also invalid_key`() {
+        assertEquals(RavensightReason.INVALID_KEY, RavensightReason.forRefusal(403, "forbidden"))
+        assertEquals(RavensightReason.INVALID_KEY, RavensightReason.forRefusal(403, null))
+        assertEquals(null, RavensightReason.forRefusal(500, null))
+    }
+
+    @Test
+    fun `session 403 tracking_disabled is the kill switch`() {
+        val c = core()
+        c.onSettingsResult(200, true)
+        c.track("e")
+        c.nextAction()
+        val outcome = c.onSessionResult(403, null, errorCode = "tracking_disabled")
+        assertEquals(RavensightReason.TRACKING_DISABLED, (outcome as SessionOutcome.Refused).reason)
+        assertFalse(c.isActive)
+        assertEquals(0, c.queueSize)
+        assertFalse(c.track("later"))
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+        assertEquals(RavensightReason.TRACKING_DISABLED, c.reason)
+    }
+
+    @Test
+    fun `settings 403 tracking_disabled is the kill switch`() {
+        val c = core()
+        c.track("e")
+        c.onSettingsResult(403, null, "tracking_disabled")
+        assertFalse(c.isActive)
+        assertEquals(0, c.queueSize)
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+    }
+
+    @Test
+    fun `batch 403 playtest_job_closed stops for the run`() {
+        val c = booted()
+        c.track("e")
+        c.nextAction()
+        val outcome = c.onBatchResult(403, errorCode = "playtest_job_closed")
+        assertEquals(RavensightReason.PLAYTEST_JOB_CLOSED, (outcome as BatchOutcome.Refused).reason)
+        assertEquals(0, c.queueSize)
+        assertFalse(c.track("later"))
+        c.retryOnce()
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+        assertEquals(RavensightReason.PLAYTEST_JOB_CLOSED, c.reason)
+    }
+
+    @Test
+    fun `session 403 invalid_playtest_token stops with session_failed`() {
+        val c = core()
+        c.onSettingsResult(200, true)
+        c.track("e")
+        c.nextAction()
+        val outcome = c.onSessionResult(403, null, errorCode = "invalid_playtest_token")
+        assertEquals(RavensightReason.SESSION_FAILED, (outcome as SessionOutcome.Refused).reason)
+        assertEquals(RavensightReason.SESSION_FAILED, c.stopReason)
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+    }
+
+    @Test
+    fun `batch 503 with Retry-After waits exactly that long`() {
+        val c = booted()
+        c.track("e")
+        c.nextAction()
+        assertTrue(c.onBatchResult(503, retryAfterSec = 60L, errorCode = "storage_unavailable") is BatchOutcome.RateLimited)
+        assertEquals(60_000L, c.retryInMs)
+        assertEquals(RavensightReason.RATE_LIMITED, c.reason)
+        assertEquals(1, c.queueSize)
+    }
+
+    @Test
+    fun `session 503 with Retry-After is rate_limited`() {
+        val c = core()
+        c.onSettingsResult(200, true)
+        c.requestSession()
+        c.nextAction()
+        assertTrue(c.onSessionResult(503, null, retryAfterSec = 60L) is SessionOutcome.RateLimited)
+        assertEquals(60_000L, c.retryInMs)
+    }
+
+    @Test
+    fun `reason reports offline and clears on success`() {
+        val c = core()
+        c.onSettingsResult(200, true)
+        c.track("e")
+        c.nextAction()
+        c.onSessionResult(0, null)
+        assertEquals(RavensightReason.OFFLINE, c.reason)
+        now += 10_000L
+        c.nextAction()
+        c.onSessionResult(201, "tok")
+        assertEquals(null, c.reason)
+    }
+
+    @Test
+    fun `disabled locally reports disabled`() {
+        val c = core()
+        c.setEnabled(false)
+        assertEquals(RavensightReason.DISABLED, c.reason)
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+    }
+
+    @Test
+    fun `stopForRun clears the queue and idles`() {
+        val c = core()
+        c.track("e")
+        c.stopForRun(RavensightReason.SESSION_FAILED)
+        assertEquals(0, c.queueSize)
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+        assertFalse(c.track("x"))
     }
 
     @Test

@@ -11,6 +11,50 @@ class RavensightEvent(
     val timestampSec: Long,
 )
 
+/**
+ * The reason vocabulary shared by every Ravensight SDK. [RavensightCore.reason]
+ * is one of these, or null when nothing is wrong.
+ */
+object RavensightReason {
+    /** Turned off by the game (`enabled = false`) or by the player's saved opt-out. */
+    const val DISABLED: String = "disabled"
+
+    /** The ingest key was refused (401, or a 403 that is not one of the others). */
+    const val INVALID_KEY: String = "invalid_key"
+
+    /** The server switched tracking off for this game. Permanent for the run. */
+    const val TRACKING_DISABLED: String = "tracking_disabled"
+
+    /** The network was unreachable or timed out. Retried with backoff. */
+    const val OFFLINE: String = "offline"
+
+    /** The server asked the SDK to slow down (429, or 503 with Retry-After). */
+    const val RATE_LIMITED: String = "rate_limited"
+
+    /** Opening a session failed for another reason, or a playtest token was refused. */
+    const val SESSION_FAILED: String = "session_failed"
+
+    /** The playtest job this run belongs to has closed. Permanent for the run. */
+    const val PLAYTEST_JOB_CLOSED: String = "playtest_job_closed"
+
+    /**
+     * What a 401 or 403 answer means, from any endpoint: [INVALID_KEY],
+     * [TRACKING_DISABLED], [PLAYTEST_JOB_CLOSED], or [SESSION_FAILED] for an
+     * invalid playtest token. Null for any other status. A batch 401 is a
+     * session expiry instead and is not passed through here.
+     */
+    fun forRefusal(status: Int, errorCode: String?): String? = when (status) {
+        401 -> INVALID_KEY
+        403 -> when (errorCode) {
+            "tracking_disabled" -> TRACKING_DISABLED
+            "playtest_job_closed" -> PLAYTEST_JOB_CLOSED
+            "invalid_playtest_token" -> SESSION_FAILED
+            else -> INVALID_KEY
+        }
+        else -> null
+    }
+}
+
 /** Tuning knobs for [RavensightCore]. The defaults match the live API contract. */
 class RavensightCoreConfig(
     /** Offline queue cap. Oldest events are dropped first past this. */
@@ -59,6 +103,9 @@ sealed class SessionOutcome {
     object Ready : SessionOutcome()
     class RateLimited(val reason: String) : SessionOutcome()
     class Failed(val reason: String) : SessionOutcome()
+
+    /** 401 or 403: [reason] is a [RavensightReason] value and automatic retries stop. */
+    class Refused(val reason: String) : SessionOutcome()
 }
 
 /** Result of feeding a batch response into the core. */
@@ -80,6 +127,9 @@ sealed class BatchOutcome {
 
     /** Anything else: backoff scheduled, the batch stays queued. */
     class Failed(val reason: String) : BatchOutcome()
+
+    /** 403: [reason] is a [RavensightReason] value and automatic retries stop. */
+    class Refused(val reason: String) : BatchOutcome()
 }
 
 /** Counters for diagnostics. Dropped counts both queue overflow and 400 rejections. */
@@ -94,8 +144,9 @@ class RavensightStats(
 /**
  * The whole Ravensight delivery protocol as a pure state machine: the event
  * queue, batching in fifties, the server kill switch, session lifecycle,
- * re-authentication on 401, Retry-After on 429, exponential backoff from 10s
- * to a 5 minute ceiling, and oversize splitting on 400.
+ * re-authentication on a batch 401, a refused key that stops automatic
+ * retries, Retry-After on 429 and 503, exponential backoff from 10s to a 5
+ * minute ceiling, and oversize splitting on 400.
  *
  * This class performs no I/O and imports nothing from Android. A driver loop
  * (the Ravensight class in the Android module, or a unit test) repeatedly asks
@@ -133,6 +184,16 @@ class RavensightCore(
     private var consecutiveAuthFailures = 0
     private var inFlightBatchSize = 0
 
+    /** Set by a refused ingest key. Automatic attempts stop; [retryOnce] allows one more. */
+    var keyRefused: Boolean = false
+        private set
+
+    /** A permanent stop for this run ([RavensightReason] value), or null. */
+    var stopReason: String? = null
+        private set
+
+    private var lastFailure: String? = null
+
     private var sent = 0L
     private var dropped = 0L
     private var flushes = 0L
@@ -140,9 +201,26 @@ class RavensightCore(
 
     // --- State queries -----------------------------------------------------
 
-    /** True unless disabled locally or by the server kill switch. */
+    /**
+     * True unless disabled locally, by the server kill switch or by a
+     * permanent stop. While the key is refused this stays true so events keep
+     * queueing (the cap applies), but nothing is sent automatically.
+     */
     val isActive: Boolean
-        get() = enabledLocally && trackingEnabled
+        get() = enabledLocally && trackingEnabled && stopReason == null
+
+    /**
+     * Why the SDK is not delivering, as a [RavensightReason] value, or null
+     * when nothing is known to be wrong.
+     */
+    val reason: String?
+        get() = when {
+            !enabledLocally -> RavensightReason.DISABLED
+            stopReason != null -> stopReason
+            !trackingEnabled -> RavensightReason.TRACKING_DISABLED
+            keyRefused -> RavensightReason.INVALID_KEY
+            else -> lastFailure
+        }
 
     val queueSize: Int
         get() = queue.size
@@ -178,15 +256,19 @@ class RavensightCore(
      * cap is reached so the newest always survive. Safe to call before the
      * settings check has answered. Returns false when tracking is off.
      */
-    fun track(name: String, data: Map<String, Any?> = emptyMap()): Boolean {
-        require(name.isNotEmpty()) { "event name is required" }
+    /**
+     * [timestampSec] is when the event happened, in Unix seconds; null means
+     * now. Returns false, and never throws, for a blank name.
+     */
+    fun track(name: String, data: Map<String, Any?> = emptyMap(), timestampSec: Long? = null): Boolean {
+        if (name.isBlank()) return false
         if (!isActive) return false
 
         while (queue.size >= config.maxQueueSize) {
             queue.removeFirst()
             dropped++
         }
-        queue.addLast(RavensightEvent(name, data, nowMs() / 1000L))
+        queue.addLast(RavensightEvent(name, data, timestampSec ?: (nowMs() / 1000L)))
         return true
     }
 
@@ -204,6 +286,50 @@ class RavensightCore(
         sessionExpiresAtMs = 0L
     }
 
+    /**
+     * An explicit flush after a refused key: allow exactly one more attempt.
+     * Another refusal sets [keyRefused] again.
+     */
+    fun retryOnce() {
+        if (!keyRefused) return
+        keyRefused = false
+        nextAttemptAtMs = 0L
+    }
+
+    /**
+     * Stops for the rest of the run with [reason]: the queue is cleared, the
+     * session is forgotten and [nextAction] answers Idle from now on.
+     */
+    fun stopForRun(reason: String) {
+        if (stopReason != null) return
+        stopReason = reason
+        clearQueue()
+        invalidateSession()
+    }
+
+    /**
+     * Applies a 401 or 403 answer from any endpoint ([RavensightReason.forRefusal]).
+     * Returns the reason so the caller can report it.
+     */
+    fun onRefused(reason: String): String {
+        when (reason) {
+            RavensightReason.INVALID_KEY -> keyRefused = true
+            RavensightReason.TRACKING_DISABLED -> {
+                trackingEnabled = false
+                clearQueue()
+                invalidateSession()
+            }
+            else -> stopForRun(reason)
+        }
+        return reason
+    }
+
+    /** Discards everything queued, counting it as dropped. */
+    fun clearQueue() {
+        dropped += queue.size
+        queue.clear()
+    }
+
     // --- The driver loop ---------------------------------------------------
 
     /**
@@ -212,9 +338,9 @@ class RavensightCore(
      * [RavensightAction.Idle] and [RavensightAction.WaitUntil] end the loop.
      */
     fun nextAction(): RavensightAction {
-        if (!enabledLocally) return RavensightAction.Idle
-        if (!settingsChecked) return RavensightAction.CheckSettings
+        if (!enabledLocally || stopReason != null || keyRefused) return RavensightAction.Idle
         if (!trackingEnabled) return RavensightAction.Idle
+        if (!settingsChecked) return RavensightAction.CheckSettings
 
         val now = nowMs()
         if (now < nextAttemptAtMs) return RavensightAction.WaitUntil(nextAttemptAtMs)
@@ -238,11 +364,18 @@ class RavensightCore(
 
     /**
      * Feed back the GET /settings response. [status] is the HTTP status, or 0
-     * for a network failure. An unreachable or malformed settings endpoint
-     * assumes tracking is on, matching the Godot SDK, so a settings outage
-     * never silently loses a session. Returns the resulting kill switch state.
+     * for a network failure. A 401 or 403 is a refusal ([onRefused]); the
+     * settings check is then repeated on the next allowed attempt. Any other
+     * unreachable or malformed answer assumes tracking is on, so a settings
+     * outage never silently loses a session. Returns the resulting kill
+     * switch state.
      */
-    fun onSettingsResult(status: Int, trackingEnabledValue: Boolean?): Boolean {
+    fun onSettingsResult(status: Int, trackingEnabledValue: Boolean?, errorCode: String? = null): Boolean {
+        val refusal = RavensightReason.forRefusal(status, errorCode)
+        if (refusal != null) {
+            onRefused(refusal)
+            return trackingEnabled
+        }
         settingsChecked = true
         trackingEnabled = if (status == 200 && trackingEnabledValue != null) {
             trackingEnabledValue
@@ -276,16 +409,23 @@ class RavensightCore(
                 else -> nowMs() + (expiresInSec ?: 86_400L) * 1000L
             }
             sessions++
+            lastFailure = null
             resetBackoff()
             return SessionOutcome.Ready
         }
 
-        if (status == 429) {
+        RavensightReason.forRefusal(status, errorCode)?.let {
+            return SessionOutcome.Refused(onRefused(it))
+        }
+
+        if (status == 429 || (status == 503 && retryAfterSec != null)) {
             val reason = errorCode ?: "rate_limited"
+            lastFailure = RavensightReason.RATE_LIMITED
             scheduleRetry(retryAfterSec?.let { it * 1000L })
             return SessionOutcome.RateLimited(reason)
         }
 
+        lastFailure = if (status <= 0) RavensightReason.OFFLINE else RavensightReason.SESSION_FAILED
         if (status == 201) {
             // 201 without a token: a malformed response we cannot use.
             scheduleRetry(null)
@@ -317,6 +457,7 @@ class RavensightCore(
                 flushes++
                 batchLimit = config.maxBatchSize
                 consecutiveAuthFailures = 0
+                lastFailure = null
                 resetBackoff()
                 return BatchOutcome.Flushed(removed)
             }
@@ -332,7 +473,13 @@ class RavensightCore(
                 return BatchOutcome.SessionExpired
             }
 
+            403 -> {
+                val reason = RavensightReason.forRefusal(status, errorCode) ?: RavensightReason.INVALID_KEY
+                return BatchOutcome.Refused(onRefused(reason))
+            }
+
             429 -> {
+                lastFailure = RavensightReason.RATE_LIMITED
                 scheduleRetry(retryAfterSec?.let { it * 1000L })
                 return BatchOutcome.RateLimited(errorCode ?: "rate_limited")
             }
@@ -353,6 +500,12 @@ class RavensightCore(
             }
 
             else -> {
+                if (status == 503 && retryAfterSec != null) {
+                    lastFailure = RavensightReason.RATE_LIMITED
+                    scheduleRetry(retryAfterSec * 1000L)
+                    return BatchOutcome.RateLimited(errorCode ?: "storage_unavailable")
+                }
+                lastFailure = RavensightReason.OFFLINE
                 scheduleRetry(null)
                 return BatchOutcome.Failed(errorCode ?: httpReason(status))
             }
@@ -375,11 +528,6 @@ class RavensightCore(
         val wait = if (explicitWaitMs != null && explicitWaitMs > 0) explicitWaitMs else backoffMs
         backoffMs = (backoffMs * 2).coerceAtMost(config.maxBackoffMs)
         nextAttemptAtMs = nowMs() + wait.coerceAtLeast(500L)
-    }
-
-    private fun clearQueue() {
-        dropped += queue.size
-        queue.clear()
     }
 
     private fun httpReason(status: Int): String =
