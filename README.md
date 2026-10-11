@@ -14,8 +14,8 @@ server side kill switch, in one Kotlin library whose only dependency is
 ## Verification status
 
 Tested with `./gradlew :core:test :ravensight:testDebugUnitTest :ravensight:assembleRelease`
-on JDK 17.0.19 and Gradle 8.10.2: 47 plain JVM tests drive the protocol core,
-and 42 Robolectric 4.14.1 tests (Android API 34 runtime) drive the Android
+on JDK 17.0.19 and Gradle 8.10.2: 51 plain JVM tests drive the protocol core,
+and 51 Robolectric 4.14.1 tests (Android API 34 runtime) drive the Android
 layer with a fake transport, a fake clock and a manual worker queue.
 
 It has **not** yet been verified on a device or an emulator, and the real
