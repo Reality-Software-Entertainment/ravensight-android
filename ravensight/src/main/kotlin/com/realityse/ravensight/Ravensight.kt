@@ -4,6 +4,8 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -54,6 +56,9 @@ object Ravensight {
     internal const val EXTRA_PLAYTEST_RUN_ID = "ravensight_playtest_run_id"
     internal const val ENV_PLAYTEST_TOKEN = "RAVENSIGHT_PLAYTEST_TOKEN"
     internal const val ENV_PLAYTEST_RUN_ID = "RAVENSIGHT_PLAYTEST_RUN_ID"
+
+    /** Manifest meta-data that lets a release build honour the playtest intent extras. */
+    const val META_ALLOW_PLAYTEST_INTENT: String = "com.realityse.ravensight.ALLOW_PLAYTEST_INTENT"
 
     @Volatile
     private var controller: Controller? = null
@@ -568,16 +573,36 @@ object Ravensight {
         private fun readPlaytestExtras(activity: Activity) {
             if (firstActivitySeen) return
             firstActivitySeen = true
-            val (token, runId) = try {
+            var (token, runId) = try {
                 val intent = activity.intent
                 intent?.getStringExtra(EXTRA_PLAYTEST_TOKEN) to intent?.getStringExtra(EXTRA_PLAYTEST_RUN_ID)
             } catch (t: Throwable) {
                 null to null
             }
+            // Any app on the device can launch an exported Activity with
+            // extras, and a playtest run ignores the player's opt-out. So the
+            // extras count only in a debuggable build, or when the studio
+            // opted in through the manifest meta-data.
+            if (!token.isNullOrBlank() && !playtestIntentAllowed()) {
+                Log.w(TAG, "playtest intent extras ignored: the app is not debuggable and the manifest has no $META_ALLOW_PLAYTEST_INTENT meta-data set to true")
+                token = null
+                runId = null
+            }
             post("playtest extras") {
                 if (!token.isNullOrBlank()) choosePlaytest(token, runId, "intent")
                 resolveDeviceId()
             }
+        }
+
+        private fun playtestIntentAllowed(): Boolean {
+            val info = app.applicationInfo
+            if (info != null && info.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) return true
+            val meta = try {
+                app.packageManager.getApplicationInfo(app.packageName, PackageManager.GET_META_DATA).metaData
+            } catch (t: Throwable) {
+                null
+            } ?: info?.metaData
+            return meta?.getBoolean(META_ALLOW_PLAYTEST_INTENT, false) == true
         }
 
         // --- Lifecycle, worker thread -------------------------------------------

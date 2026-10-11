@@ -50,7 +50,9 @@ Pre-1.0, so this minor version contains breaking changes.
   the launch intent extras `ravensight_playtest_token` and
   `ravensight_playtest_run_id`, and the environment variables. A playtest
   run uses `pt-<runId>`, sends `X-Ravensight-Playtest` on every request and
-  saves nothing; `Ravensight.isPlaytest`.
+  saves nothing; `Ravensight.isPlaytest`. The intent extras count only in a
+  debuggable build or with the manifest meta-data
+  `com.realityse.ravensight.ALLOW_PLAYTEST_INTENT` set to true.
 * `Ravensight.sessionToken` for a game server's `joinToken`.
 * `RavensightConfig.FEEDBACK_CATEGORIES` and local `invalid_category` and
   `invalid_rating` checks with no request.

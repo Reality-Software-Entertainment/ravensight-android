@@ -355,6 +355,21 @@ token and a run id. The SDK reads them from, first found wins:
 3. the environment variables `RAVENSIGHT_PLAYTEST_TOKEN` and
    `RAVENSIGHT_PLAYTEST_RUN_ID`, as a last resort.
 
+Any app on a device can launch your Activity with extras, and a playtest run
+ignores the player's opt-out, so the SDK honours the intent extras only in a
+debuggable build, or when your manifest opts in. A release build you want
+playtested needs this inside `<application>`:
+
+```xml
+<meta-data
+    android:name="com.realityse.ravensight.ALLOW_PLAYTEST_INTENT"
+    android:value="true" />
+```
+
+Without it, a release build ignores the extras, logs one warning and runs as
+an ordinary player build that respects the saved opt-out. Leave it out of the
+build you ship to players.
+
 In a playtest run the device id is `pt-<runId>`, held in memory and never
 saved; every request carries the `X-Ravensight-Playtest` header; the
 player's saved opt-out is ignored, and `setTrackingEnabled` and

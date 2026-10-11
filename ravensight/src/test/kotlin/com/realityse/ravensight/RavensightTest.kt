@@ -4,7 +4,9 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.res.Configuration
+import android.os.Bundle
 import androidx.test.core.app.ApplicationProvider
 import org.json.JSONArray
 import org.json.JSONObject
@@ -19,6 +21,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowLog
 
@@ -631,15 +634,76 @@ class RavensightTest {
 
     // --- Playtest ---------------------------------------------------------
 
-    @Test
-    fun `playtest extras give a pt id, the header everywhere and nothing saved`() {
-        prefs().edit().putBoolean(Ravensight.KEY_OPT_OUT, true).commit() // ignored for the run
-        init(activityCallbacks = true)
+    private fun setDebuggable(debuggable: Boolean) {
+        val pm = shadowOf(app.packageManager).getInternalMutablePackageInfo(app.packageName).applicationInfo!!
+        for (info in listOf(app.applicationInfo, pm)) {
+            info.flags = if (debuggable) {
+                info.flags or ApplicationInfo.FLAG_DEBUGGABLE
+            } else {
+                info.flags and ApplicationInfo.FLAG_DEBUGGABLE.inv()
+            }
+        }
+    }
+
+    private fun setAllowMeta(allow: Boolean?) {
+        val bundle = allow?.let { Bundle().apply { putBoolean(Ravensight.META_ALLOW_PLAYTEST_INTENT, it) } }
+        shadowOf(app.packageManager).getInternalMutablePackageInfo(app.packageName).applicationInfo!!.metaData = bundle
+        app.applicationInfo.metaData = bundle
+    }
+
+    private fun launchWithPlaytestExtras() {
         val intent = Intent(app, Activity::class.java)
             .putExtra("ravensight_playtest_token", "ptok")
             .putExtra("ravensight_playtest_run_id", "run42")
         Robolectric.buildActivity(Activity::class.java, intent).create()
         worker.runDue()
+    }
+
+    @Test
+    fun `playtest extras are ignored on a release build without the meta-data`() {
+        setDebuggable(false)
+        setAllowMeta(null)
+        prefs().edit().putBoolean(Ravensight.KEY_OPT_OUT, true).commit()
+        init(activityCallbacks = true)
+        launchWithPlaytestExtras()
+        foreground()
+        advance(60_000)
+        assertFalse(Ravensight.isPlaytest)
+        assertEquals(0, http.requests.size) // the opt-out still holds
+        assertTrue(ShadowLog.getLogsForTag("Ravensight").any { it.msg.contains("playtest intent extras ignored") })
+    }
+
+    @Test
+    fun `playtest extras are ignored on a release build with the meta-data false`() {
+        setDebuggable(false)
+        setAllowMeta(false)
+        init(activityCallbacks = true)
+        launchWithPlaytestExtras()
+        foreground()
+        assertFalse(Ravensight.isPlaytest)
+        assertTrue(http.requests.none { it.headers.containsKey("X-Ravensight-Playtest") })
+        assertTrue(Ravensight.deviceId!!.startsWith("dev_"))
+    }
+
+    @Test
+    fun `playtest extras are honoured on a release build with the meta-data`() {
+        setDebuggable(false)
+        setAllowMeta(true)
+        init(activityCallbacks = true)
+        launchWithPlaytestExtras()
+        foreground()
+        assertTrue(Ravensight.isPlaytest)
+        assertEquals("pt-run42", Ravensight.deviceId)
+        assertTrue(http.requests.all { it.headers["X-Ravensight-Playtest"] == "ptok" })
+    }
+
+    @Test
+    fun `playtest extras give a pt id, the header everywhere and nothing saved`() {
+        setDebuggable(true)
+        setAllowMeta(null)
+        prefs().edit().putBoolean(Ravensight.KEY_OPT_OUT, true).commit() // ignored for the run
+        init(activityCallbacks = true)
+        launchWithPlaytestExtras()
         foreground()
         assertTrue(Ravensight.isPlaytest)
         assertEquals("pt-run42", Ravensight.deviceId)
