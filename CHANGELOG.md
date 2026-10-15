@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.0] - 2026-10-15
+
+### Added
+
+* Typed event helpers `Ravensight.trackPurchase`, `trackResource`,
+  `trackProgression` and `trackError`, thin builders of the reserved `rs_`
+  properties over `track`, each with an optional extra map and event name.
+* Opt-in health sampling, `RavensightConfig.performance` (default false): a
+  `Choreographer` frame callback sampled once per second, sent as one `health`
+  event per session on background entry with median and 10th percentile fps,
+  used memory and boot time.
+* `RS_KINDS` and the verbose reserved key check now know `purchase`,
+  `resource`, `progression`, `error`, `health` and every typed key;
+  `rs_invalid` is still warned about because only the server writes it.
+* The session request now sends `"sdk": "android/<version>"`.
+
 ## [0.2.0] - 2026-10-10
 
 Brings the Android SDK to the same contract as every other Ravensight SDK.

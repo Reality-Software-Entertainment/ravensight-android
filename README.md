@@ -42,7 +42,7 @@ Then add the dependency (`app/build.gradle.kts`):
 
 ```kotlin
 dependencies {
-    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.2.0")
+    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.3.0")
 }
 ```
 
@@ -118,6 +118,10 @@ blocking, safe from any thread, and never throws.
 | --- | --- |
 | `Ravensight.initialize(context, ingestKey)` | Starts the SDK. Also takes a `RavensightConfig` and a `RavensightListener`. |
 | `Ravensight.track(name, data)` | Queues an event. `data` is optional. Returns false for a blank name or when tracking is off. |
+| `Ravensight.trackPurchase(amount, currency, itemType, itemId, cart, transactionId, extra, eventName)` | Typed purchase event. See "Typed events". |
+| `Ravensight.trackResource(flow, resource, amount, itemType, itemId, extra, eventName)` | Typed resource event, `source` or `sink`. |
+| `Ravensight.trackProgression(status, p1, p2, p3, score, extra, eventName)` | Typed progression event: `start`, `complete` or `fail`. |
+| `Ravensight.trackError(severity, message, stack, extra, eventName)` | Typed error event. |
 | `Ravensight.flush()` | Asks for an immediate flush. After a refused key it makes exactly one more attempt. |
 | `Ravensight.submitFeedback(message, category, rating)` | Posts player feedback. Outcome arrives on the listener. |
 | `Ravensight.fetchSuggestions()` | EXPERIMENTAL. AI generated design suggestions for your game, via the listener. An empty list, with no request, while tracking is off. |
@@ -159,6 +163,7 @@ callbacks are delivered on the main thread.
 | `sessionTimeoutMs` | `1800000` | How long the app may stay in the background before the session ends (30 minutes). |
 | `flushOnBackground` | on | Flushes every time the app leaves the foreground. |
 | `verboseLogging` | off | Logs SDK activity to Logcat under the `Ravensight` tag, and warns about reserved `rs_` keys. |
+| `performance` | off | Opt-in health sampling: frame rate once per second, one `health` event per session on background entry. See "Typed events". |
 | `enabled` | on | False starts switched off: no request of any kind until `setEnabled(true)`. Never saved. |
 | `playtestToken` | null | Ravensight Playtest run token. Normally read from the launch intent instead. |
 | `playtestRunId` | null | Ravensight Playtest run id, paired with the token. |
@@ -219,6 +224,58 @@ Ravensight.track("cutscene_started", mapOf("rs_kind" to "none")) // not a level 
 With `verboseLogging = true` the SDK warns once per event and key about an
 `rs_kind` outside that list or an `rs_` key Ravensight does not read. It never
 throws and still queues the event.
+
+## Typed events
+
+The four helpers below only build the reserved `rs_` properties and call
+`Ravensight.track`, so queueing, batching, retries, opt-out and the playtest
+path are unchanged, and each returns what `track` returns. Every helper takes
+an optional `extra` map, merged first so the reserved keys win, and an
+optional `eventName`. They never throw on bad input: a wrong value becomes an
+event the server flags with `rs_invalid`, which shows on the Implementation
+health card.
+
+Purchase. `amount` is whole minor units (499 is 4.99), as an integer or a
+string of digits. `currency` is upper-cased. The default event name is
+`purchase`.
+
+```kotlin
+Ravensight.trackPurchase(499, "usd", "bundle", "starter_pack", transactionId = "txn_1001")
+```
+
+Resource. `flow` is `source` or `sink`, `amount` is a number. The default
+event name is `resource_source` or `resource_sink`.
+
+```kotlin
+Ravensight.trackResource("source", "gold", 25, itemType = "quest", itemId = "q12")
+```
+
+Progression. `status` is `start`, `complete` or `fail`. The default event name
+is `progression_start`, `progression_complete` or `progression_fail`.
+
+```kotlin
+Ravensight.trackProgression("complete", "world1", "cave", score = 1200)
+```
+
+Error. `severity` is `debug`, `info`, `warning`, `error` or `critical`. The
+message is cut to 200 characters and the stack to 2000. The default event
+name is `error`.
+
+```kotlin
+Ravensight.trackError("error", "save failed", stack = Log.getStackTraceString(e))
+```
+
+Health sampling is opt-in. With `performance = true` the SDK counts frames
+with a `Choreographer` callback while the app is in the foreground, keeps one
+frames per second sample each second (a reservoir of at most 600), and sends
+exactly one `health` event per session when the app first goes to the
+background, because Android has no exit callback. It carries the median and
+10th percentile fps, the used heap in MB from `Runtime`, and the milliseconds
+from process start to `initialize`. Nothing is sent if no sample was taken.
+
+```kotlin
+Ravensight.initialize(this, RavensightConfig(ingestKey = "gt_live_...", performance = true))
+```
 
 ## Status and failures
 

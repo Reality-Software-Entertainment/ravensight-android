@@ -69,6 +69,14 @@ class RavensightConfig @JvmOverloads constructor(
     val playtestToken: String? = null,
     /** Ravensight Playtest run id, paired with [playtestToken]. */
     val playtestRunId: String? = null,
+    /**
+     * Opt-in: sample the frame rate once per second with a Choreographer
+     * frame callback while the app is in the foreground, and send one
+     * "health" event per session when the app first goes to the background:
+     * median and 10th percentile fps, used memory in MB and boot time in
+     * milliseconds. Nothing is sent if no sample was taken. Off by default.
+     */
+    val performance: Boolean = false,
 ) {
     companion object {
         /** The bare host; "/api/v1" is appended by [normalizeApiUrl]. */
@@ -81,9 +89,12 @@ class RavensightConfig @JvmOverloads constructor(
         val FEEDBACK_CATEGORIES: List<String> =
             listOf("bug", "suggestion", "complaint", "praise", "playtest", "other")
 
-        /** Values the reserved rs_kind event property accepts. */
+        /** Values the reserved rs_kind event property accepts: the level kinds and the five typed kinds. */
         @JvmField
-        val RS_KINDS: List<String> = listOf("level_start", "level_complete", "death", "none")
+        val RS_KINDS: List<String> = listOf(
+            "level_start", "level_complete", "death", "none",
+            "purchase", "resource", "progression", "error", "health",
+        )
 
         /**
          * Trims whitespace, strips every trailing "/", strips a trailing
