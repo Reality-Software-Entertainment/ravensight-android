@@ -490,6 +490,7 @@ object Ravensight {
         internal val frameSampler = FrameSampler()
         private var frames: ChoreographerFrames? = null
         @Volatile private var healthSent = false
+        @Volatile private var uiForeground = false
         private val bootMs: Long? = try {
             deps.bootMs()
         } catch (t: Throwable) {
@@ -526,7 +527,9 @@ object Ravensight {
             // initialize from an Activity: its intent may carry the playtest extras.
             (context as? Activity)?.let { readPlaytestExtras(it) }
             if (deps.observeProcessLifecycle) onMain { observeProcessLifecycle() }
-            if (config.performance && deps.frameCallbacks) frames = ChoreographerFrames(frameSampler)
+            if (config.performance && (deps.frameCallbacks || deps.frameScheduler != null)) {
+                frames = ChoreographerFrames(frameSampler, deps.frameScheduler ?: ChoreographerScheduler)
+            }
         }
 
         private fun effectiveEnabled(): Boolean = enabledByGame && (isPlaytest || !optedOut)
@@ -572,12 +575,14 @@ object Ravensight {
 
         fun setEnabledByGame(enabled: Boolean) {
             enabledByGame = enabled
+            applyFrameSampling()
             active = serverAllows && effectiveEnabled()
             post("setEnabled") { applyEnabled() }
         }
 
         fun setOptedOut(value: Boolean) {
             optedOut = value
+            applyFrameSampling()
             active = serverAllows && effectiveEnabled()
             post("setTrackingEnabled") {
                 applyEnabled()
@@ -634,15 +639,31 @@ object Ravensight {
             false
         }
 
+        /**
+         * Frames are sampled only while the app is in the foreground and
+         * tracking is on, so a disabled client never holds a callback. The
+         * single send per session is sendHealth's job, not this gate's.
+         */
+        private fun applyFrameSampling() {
+            if (!config.performance) return
+            onMain {
+                runSafely("frame sampling") {
+                    if (uiForeground && effectiveEnabled()) frames?.start() else frames?.stop()
+                }
+            }
+        }
+
         internal fun onForegroundSignal() {
             val now = clock()
-            if (config.performance && !healthSent) onMain { runSafely("frame sampling") { frames?.start() } }
+            uiForeground = true
+            applyFrameSampling()
             post("foreground") { foreground(now) }
         }
 
         internal fun onBackgroundSignal() {
             val now = clock()
-            if (config.performance) onMain { runSafely("frame sampling") { frames?.stop() } }
+            uiForeground = false
+            applyFrameSampling()
             post("background") { background(now) }
         }
 
@@ -758,7 +779,7 @@ object Ravensight {
          * exit callback). Nothing is sent when no sample was taken.
          */
         private fun sendHealth(now: Long) {
-            if (!config.performance || healthSent) return
+            if (!config.performance || healthSent || !effectiveEnabled()) return
             val summary = frameSampler.summary() ?: return
             val data = TypedEvents.health(summary, deps.memoryMb(), bootMs)
             if (core.track("health", data, now / 1000L)) healthSent = true
@@ -1217,6 +1238,8 @@ object Ravensight {
         }
 
         internal fun shutdownForTest() {
+            uiForeground = false
+            applyFrameSampling()
             (app as? Application)?.unregisterActivityLifecycleCallbacks(this)
             (worker as? HandlerWorker)?.quit()
         }
@@ -1260,6 +1283,8 @@ internal class RavensightDeps(
     val registerActivityCallbacks: Boolean = true,
     /** Drive the Choreographer for health sampling. Tests feed frames by hand instead. */
     val frameCallbacks: Boolean = true,
+    /** Replaces the Choreographer, so tests can see start and stop and fire frames. */
+    val frameScheduler: FrameScheduler? = null,
     /** Used heap in MB, from Runtime. */
     val memoryMb: () -> Double? = {
         val rt = Runtime.getRuntime()
@@ -1269,25 +1294,40 @@ internal class RavensightDeps(
     val bootMs: () -> Long? = { SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime() },
 )
 
-/** A Choreographer frame callback that feeds a [FrameSampler]. Main thread only. */
-internal class ChoreographerFrames(private val sampler: FrameSampler) : Choreographer.FrameCallback {
+/** Where frame callbacks are scheduled. The Choreographer in production. */
+internal interface FrameScheduler {
+    fun post(callback: Choreographer.FrameCallback)
+    fun remove(callback: Choreographer.FrameCallback)
+}
+
+internal object ChoreographerScheduler : FrameScheduler {
+    override fun post(callback: Choreographer.FrameCallback) = Choreographer.getInstance().postFrameCallback(callback)
+    override fun remove(callback: Choreographer.FrameCallback) = Choreographer.getInstance().removeFrameCallback(callback)
+}
+
+/** A frame callback that feeds a [FrameSampler]. Main thread only. */
+internal class ChoreographerFrames(
+    private val sampler: FrameSampler,
+    private val scheduler: FrameScheduler,
+) : Choreographer.FrameCallback {
     private var running = false
 
     fun start() {
         if (running) return
         running = true
         sampler.resetWindow()
-        Choreographer.getInstance().postFrameCallback(this)
+        scheduler.post(this)
     }
 
     fun stop() {
+        if (!running) return
         running = false
-        Choreographer.getInstance().removeFrameCallback(this)
+        scheduler.remove(this)
     }
 
     override fun doFrame(frameTimeNanos: Long) {
         if (!running) return
         sampler.onFrame(frameTimeNanos)
-        Choreographer.getInstance().postFrameCallback(this)
+        scheduler.post(this)
     }
 }

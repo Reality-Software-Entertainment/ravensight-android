@@ -3,6 +3,7 @@ package com.realityse.ravensight
 import android.app.Application
 import android.content.Context
 import android.util.Log
+import android.view.Choreographer
 import androidx.test.core.app.ApplicationProvider
 import org.json.JSONObject
 import org.junit.After
@@ -23,6 +24,34 @@ private fun feedWindow(sampler: FrameSampler, from: Long, fps: Int): Long {
     val end = from + 1_000_000_000L
     sampler.onFrame(end)
     return end
+}
+
+/** Stands in for the Choreographer: records the one pending callback so tests can fire frames. */
+private class FakeScheduler : FrameScheduler {
+    var pending: Choreographer.FrameCallback? = null
+    var posts = 0
+    var removes = 0
+    private var t = 0L
+
+    override fun post(callback: Choreographer.FrameCallback) {
+        pending = callback
+        posts++
+    }
+
+    override fun remove(callback: Choreographer.FrameCallback) {
+        if (pending === callback) pending = null
+        removes++
+    }
+
+    /** Fires `n` frames one second apart, so each yields one sample, if a callback is pending. */
+    fun frames(n: Int) {
+        repeat(n) {
+            val cb = pending ?: return
+            pending = null
+            cb.doFrame(t)
+            t += 1_000_000_000L
+        }
+    }
 }
 
 /** The typed event helpers and opt-in health sampling, on the same fake transport and manual worker. */
@@ -48,7 +77,7 @@ class TypedEventsTest {
         Ravensight.resetForTest()
     }
 
-    private fun start(performance: Boolean = false, verbose: Boolean = false) {
+    private fun start(performance: Boolean = false, verbose: Boolean = false, scheduler: FrameScheduler? = null) {
         Ravensight.initialize(
             app,
             RavensightConfig(
@@ -67,6 +96,7 @@ class TypedEventsTest {
                 observeProcessLifecycle = false,
                 registerActivityCallbacks = false,
                 frameCallbacks = false,
+                frameScheduler = scheduler,
                 memoryMb = { 128.5 },
                 bootMs = { 900L },
             ),
@@ -330,5 +360,93 @@ class TypedEventsTest {
         feed(listOf(60, 60))
         background()
         assertTrue(flushed().none { it.getString("event") == "health" })
+    }
+
+    // --- Real frame callback gating, opt-out and teardown ---------------------
+
+    @Test
+    fun `the frame callback runs per foreground and a second session sends a second health event`() {
+        val fs = FakeScheduler()
+        start(performance = true, scheduler = fs)
+        assertTrue(fs.pending != null)
+        fs.frames(4)
+        background()
+        assertEquals(null, fs.pending)
+        assertEquals(1, flushed().count { it.getString("event") == "health" })
+
+        now += 31 * 60_000L
+        foreground()
+        assertTrue("sampling must restart for the new session", fs.pending != null)
+        fs.frames(4)
+        background()
+        assertEquals(null, fs.pending)
+        assertEquals(2, flushed().count { it.getString("event") == "health" })
+    }
+
+    @Test
+    fun `tracking off stops the callback, keeps it stopped, and turning it back on restarts it`() {
+        val fs = FakeScheduler()
+        start(performance = true, scheduler = fs)
+        assertTrue(fs.pending != null)
+        Ravensight.setTrackingEnabled(app, false)
+        assertEquals(null, fs.pending)
+        background()
+        foreground()
+        assertEquals(null, fs.pending)
+        Ravensight.setTrackingEnabled(app, true)
+        assertTrue(fs.pending != null)
+    }
+
+    @Test
+    fun `the game switch off stops the callback too`() {
+        val fs = FakeScheduler()
+        start(performance = true, scheduler = fs)
+        Ravensight.setEnabled(false)
+        assertEquals(null, fs.pending)
+    }
+
+    @Test
+    fun `teardown removes the frame callback`() {
+        val fs = FakeScheduler()
+        start(performance = true, scheduler = fs)
+        assertTrue(fs.pending != null)
+        Ravensight.resetForTest()
+        assertEquals(null, fs.pending)
+    }
+
+    @Test
+    fun `with tracking disabled every typed helper queues nothing and the transport sees no request`() {
+        start()
+        Ravensight.setTrackingEnabled(app, false)
+        worker.runDue()
+        val before = http.requests.size
+        assertFalse(Ravensight.trackPurchase(499, "usd", "a", "b"))
+        assertFalse(Ravensight.trackResource("source", "gold", 1))
+        assertFalse(Ravensight.trackProgression("start", "w"))
+        assertFalse(Ravensight.trackError("error", "m"))
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals(before, http.requests.size)
+        assertTrue(http.requests.none { it.body?.contains("rs_kind") == true })
+    }
+
+    @Test
+    fun `with performance on and tracking disabled, frames then background queue nothing`() {
+        val fs = FakeScheduler()
+        start(performance = true, scheduler = fs)
+        Ravensight.setTrackingEnabled(app, false)
+        worker.runDue()
+        fs.frames(5)
+        Ravensight.controllerForTest!!.frameSampler.let { s ->
+            var t = 0L
+            s.onFrame(t)
+            repeat(3) { t += 1_000_000_000L; s.onFrame(t) }
+        }
+        val before = http.requests.size
+        background()
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals(before, http.requests.size)
+        assertTrue(http.requests.none { it.body?.contains("\"health\"") == true })
     }
 }
