@@ -8,15 +8,17 @@ server side kill switch, in one Kotlin library whose only dependency is
 
 * API base: `https://api.ravensight.io` (`/api/v1` is appended for you)
 * Docs: https://ravensight.io/docs/
-* Privacy: a random device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(context, false)`), a reset (`Ravensight.resetDeviceId()`), no tracking permission prompt needed. The id is per install, and the saved opt-out stays on this device, once you merge the Auto Backup rules (see "Device id, privacy and Auto Backup"). What your store label can say: https://ravensight.io/docs/#privacy-label
+* Privacy: a random device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(context, false)`), an opt-in mode that saves and sends nothing before the player's yes (`consent = RavensightConsent.OPT_IN`), a reset (`Ravensight.resetDeviceId()`), no tracking permission prompt needed. The id is per install, and the saved opt-out stays on this device, once you merge the Auto Backup rules (see "Device id, privacy and Auto Backup"). What your store label can say: https://ravensight.io/docs/#privacy-label
 * minSdk 24 (Android 7.0), Kotlin only
+* Public builds: since 0.3.0, `gt_pub_` keys, inert without a key, opt-in consent, a distribution label, `rs_event_id` on every event and an 8 KB event cap (see "Public builds")
 
 ## Verification status
 
 Tested with `./gradlew :core:test :ravensight:testDebugUnitTest :ravensight:assembleRelease`
-on JDK 17.0.19 and Gradle 8.10.2: 51 plain JVM tests drive the protocol core,
-and 52 Robolectric 4.14.1 tests (Android API 34 runtime) drive the Android
-layer with a fake transport, a fake clock and a manual worker queue.
+on JDK 17.0.19 and Gradle 8.10.2: 59 plain JVM tests drive the protocol core,
+and 68 Robolectric 4.14.1 tests (Android API 34 runtime) drive the Android
+layer with a fake transport, a fake clock and a manual worker queue. 25 of
+them cover the 0.3.0 public build rules (see "Public builds").
 
 It has **not** yet been verified on a device or an emulator, and the real
 `ProcessLifecycleOwner` foreground and background signals are not covered by
@@ -42,7 +44,7 @@ Then add the dependency (`app/build.gradle.kts`):
 
 ```kotlin
 dependencies {
-    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.2.0")
+    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.3.0")
 }
 ```
 
@@ -148,7 +150,7 @@ callbacks are delivered on the main thread.
 
 | `RavensightConfig` field | Default | Meaning |
 | --- | --- | --- |
-| `ingestKey` | required | Your publishable `gt_live_...` key. A blank key logs an error and stops the SDK with `invalid_key`. |
+| `ingestKey` | required | Your publishable `gt_live_...` key, or a `gt_pub_...` public key. A blank key makes the SDK inert for the run with `no_key` (see "Public builds"). |
 | `apiUrl` | `https://api.ravensight.io` | Only change this if you self host. Whitespace and trailing slashes are trimmed, `/api/v1` is appended when omitted, and empty means the default. |
 | `gameVersion` | empty | Empty uses your app's `versionName`. |
 | `maxQueueSize` | `500` | Queue cap. Oldest events are dropped first. |
@@ -162,6 +164,9 @@ callbacks are delivered on the main thread.
 | `enabled` | on | False starts switched off: no request of any kind until `setEnabled(true)`. Never saved. |
 | `playtestToken` | null | Ravensight Playtest run token. Normally read from the launch intent instead. |
 | `playtestRunId` | null | Ravensight Playtest run id, paired with the token. |
+| `optional` | off | Silences the one warning a blank `ingestKey` logs. |
+| `consent` | `OPT_OUT` | `RavensightConsent.OPT_IN` saves nothing, creates no device id and sends nothing until `setTrackingEnabled(context, true)`. See "Public builds". |
+| `distribution` | null | A short label for where this build was distributed, such as `"play-store"`, sent when a session opens. At most 40 characters, no control characters; anything else is ignored with one warning. |
 
 ## About your ingest key
 
@@ -228,13 +233,97 @@ is called whenever it changes.
 
 | Reason | What happened | What the SDK does |
 | --- | --- | --- |
-| `disabled` | `enabled = false`, `setEnabled(false)` or the player's saved opt-out. | Nothing touches the network. |
-| `invalid_key` | A `401`, or a `403` other than the ones below, from any endpoint. | Logs one warning, `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` Events keep queueing (the cap applies); automatic sending stops; `flush()` makes one more attempt. |
+| `no_key` | `initialize` was given a blank ingest key. | Inert for the run: nothing saved, no worker thread, no request, no lifecycle callback. One warning unless `optional = true`. |
+| `disabled` | `enabled = false`, `setEnabled(false)`, the player's saved opt-out, or, with `consent = OPT_IN`, no yes yet. | Nothing touches the network. |
+| `invalid_key` | A `401`, or a `403` other than the ones below. | Logs one warning, `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ or gt_pub_ key.` On the settings check or a session open the run ends: the queue is cleared and nothing is retried, not even by `flush()`. On a batch or another endpoint, automatic sending stops and `flush()` makes one more attempt. |
 | `tracking_disabled` | The kill switch is on for your game (`GET /settings` or a `403 tracking_disabled`). | Clears the queue and sends nothing more this run. `onTrackingDisabled("server")`. |
-| `offline` | The network was unreachable or timed out, or a batch answered `5xx`. | Keeps events and retries after 10 seconds, doubling to 5 minutes. |
+| `offline` | The network was unreachable or timed out, or a batch answered `5xx`. | Keeps events and retries after 10 seconds, doubling to 5 minutes, each wait varied by plus or minus 20 percent. |
 | `rate_limited` | `429`, or `503` with `Retry-After`, from the settings check, the session or a batch. | Waits exactly `Retry-After`, then retries. |
 | `session_failed` | Opening a session failed another way, or a playtest token was refused or arrived without a run id. | Retries with backoff; a playtest refusal stops the run. |
 | `playtest_job_closed` | The playtest job this run belongs to has closed. | Clears the queue and sends nothing more this run. |
+
+## Public builds
+
+For a game whose build or source anyone can download (an open source
+project, a demo on a public page, an APK shared with testers):
+
+* **Use a public key.** Create a `gt_pub_...` key in the dashboard. It can
+  open sessions and send events under the limits its policy sets (event
+  names, origins, versions, sizes), and nothing else.
+* **Inject it at build time, never commit it.** For example from a Gradle
+  property (`ravensightKey` in `~/.gradle/gradle.properties`, or
+  `-PravensightKey=...` in CI) into `BuildConfig`, so a fork or a clone
+  builds without one:
+
+  ```kotlin
+  // app/build.gradle.kts
+  android {
+      buildFeatures { buildConfig = true }
+      defaultConfig {
+          buildConfigField("String", "RAVENSIGHT_KEY", "\"${providers.gradleProperty("ravensightKey").getOrElse("")}\"")
+      }
+  }
+  ```
+
+* **Without a key the SDK is inert.** `initialize` with a blank key saves
+  nothing in `SharedPreferences`, starts no worker thread, registers no
+  lifecycle callback and makes no request. `track` returns false,
+  `isEnabled` is false and `statusReason` is `no_key`. It logs one warning;
+  set `optional = true` to silence it. `resetDeviceId()` forgets any saved
+  id and returns `""`.
+* **Opt-in mode.** With `consent = RavensightConsent.OPT_IN` nothing
+  happens before the player's yes: no device id is created, no settings
+  check is made and no session opens. Events tracked before the yes are
+  dropped, not held for later (`track` returns false).
+  `setTrackingEnabled(context, true)` is the yes: it is saved synchronously
+  in the SDK's `SharedPreferences` (`tracking_opt_in`, beside the opt-out),
+  creates the device id and starts the SDK; events tracked right after it
+  are queued while the settings check runs. `setTrackingEnabled(context,
+  false)` withdraws it and keeps the device id; `resetDeviceId()` is the
+  separate "forget me", and before a yes it forgets the saved id without
+  making a new one. Called before `initialize`, `setTrackingEnabled` does
+  not know the mode yet and saves the choice both ways. The default,
+  `OPT_OUT`, behaves as 0.2.0 did.
+* **Distribution.** `distribution = "itch"` (or `"play-store"`, or your
+  own label, at most 40 characters) is sent when a session opens, so the
+  dashboard can tell builds apart.
+
+```kotlin
+Ravensight.initialize(
+    this,
+    RavensightConfig(
+        ingestKey = BuildConfig.RAVENSIGHT_KEY,
+        optional = true,                      // a build without a key is fine
+        consent = RavensightConsent.OPT_IN,   // ask first
+        distribution = "public-demo",
+    ),
+)
+
+// Later, from your consent screen:
+Ravensight.setTrackingEnabled(context, playerSaidYes)
+```
+
+What 0.3.0 adds to every build, public or not:
+
+* **`rs_event_id`.** Every event's data carries one, so the server can
+  drop a resend it already has. It is the first 16 characters of the
+  device id (a random 16 hex character value for this launch when the
+  event is tracked before the first Activity, when the id is not known
+  yet), the start time in hex, 8 hex characters from `SecureRandom` minted
+  once per launch, and a counter, for example
+  `dev_3f9c0a1b2c3d-6720f1a0-9b1e44c2-12`. It always matches
+  `^[A-Za-z0-9_-]{1,64}$`, is written into the event when it is tracked,
+  and a resend after a failure carries the same ids. The queue lives in
+  memory, so there is no saved queue for it to survive. A value of your
+  own under that key is replaced.
+* **An 8 KB event cap.** An event whose data is larger than 8,192 bytes as
+  JSON is dropped when tracked, never sent: `track` returns false, one
+  warning is logged for the run and `onFlushFailed("event_too_large")` is
+  called for each.
+* **A refused key ends the run** (see `invalid_key` under "Status and
+  failures").
+* **Retry jitter.** A retry wait without a `Retry-After` varies by plus or
+  minus 20 percent; a `Retry-After` is still obeyed exactly.
 
 ## How delivery works
 
@@ -273,14 +362,18 @@ fun forgetMe() {
 `initialize`; the SDK reads it at start, and a saved opt-out wins over
 `enabled = true`. Turning it off clears anything queued and stops sending.
 
-If your game asks for consent before any analytics, start switched off and
-turn the SDK on once the player agrees. Nothing is sent before that:
+If your game asks for consent before any analytics, use the opt-in mode:
+nothing is saved or sent before the player's yes, and the yes is
+remembered across launches (see "Public builds"):
 
 ```kotlin
-Ravensight.initialize(this, RavensightConfig(ingestKey = "gt_live_your_key", enabled = false))
+Ravensight.initialize(this, RavensightConfig(ingestKey = "gt_live_your_key", consent = RavensightConsent.OPT_IN))
 // later, once the player has agreed
-Ravensight.setEnabled(true)
+Ravensight.setTrackingEnabled(context, true)
 ```
+
+Starting with `enabled = false` and calling `setEnabled(true)` still works,
+but it is not saved, so the game has to remember the answer itself.
 
 ## Telling players
 
@@ -300,7 +393,8 @@ the "Forget me" button is `resetDeviceId()`.
 The SDK generates a random device id (`dev_` plus 32 hex characters, from 16
 bytes of the platform's secure random source) when the first Activity is
 created, and stores it in `SharedPreferences` under `ravensight/device_id`.
-An existing id is never rewritten. No hardware identifier, advertising id,
+An existing id is never rewritten. With `consent = OPT_IN` it is created at
+the player's first yes, not before, and without a key it is never created. No hardware identifier, advertising id,
 IP based fingerprint or personal data is collected by the SDK itself. Only
 the events you choose to send leave the device.
 
@@ -390,6 +484,7 @@ core/                                 pure Kotlin JVM, no Android imports
   RavensightCore.kt                   the whole protocol as a clock injected
                                       state machine: batching, backoff, 401,
                                       403, 429, 503, 400 splitting, the queue
+  RavensightEventIds.kt               rs_event_id and the shared limits
 ravensight/                           the Android library (com.realityse.ravensight)
   Ravensight.kt                       public API, HandlerThread worker,
                                       process lifecycle, sessions, playtest

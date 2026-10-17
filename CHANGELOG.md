@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.3.0] - 2026-10-16
+
+For games whose builds or source anyone can download. A game that passes
+only a key behaves as on 0.2.0, except for the changes listed first.
+
+### Changed for 0.2.0 games
+
+* A `401` or `403` on the settings check or a session open (other than
+  `403 tracking_disabled` and a refused playtest token) now ends the run:
+  the queue is cleared and nothing is retried, an explicit `flush()`
+  included. It used to keep the queue and let `flush()` try again. A batch
+  `401` still opens a fresh session first, a batch `403` of this kind still
+  allows one explicit retry, and `statusReason` is still `invalid_key`.
+* A blank ingest key makes the SDK inert with `statusReason` `no_key`
+  (it was `invalid_key`), logs a warning instead of an error, and no longer
+  starts the worker thread or registers lifecycle callbacks.
+* Every event's data gains an `rs_event_id` (a value of your own under that
+  key is replaced), the cold launch `game_exited` included.
+* Retry waits without a `Retry-After` carry plus or minus 20 percent
+  jitter. `Retry-After` is still obeyed exactly.
+* An event whose data is over 8,192 bytes as JSON is dropped when tracked
+  instead of being sent and refused by the server: `track` returns false,
+  one warning is logged for the run and `onFlushFailed("event_too_large")`
+  is called.
+* `Ravensight.setTrackingEnabled` before `initialize` also writes
+  `tracking_opt_in` on a yes (and removes it on a no), since the consent
+  mode is not known yet.
+* `RavensightCoreConfig` has a new trailing `random` parameter (the jitter
+  source), and the core gains `countDropped`.
+
+### Added
+
+* **Inert without a key**, with `RavensightConfig.optional` to silence the
+  one warning.
+* **`consent = RavensightConsent.OPT_IN`**: no device id, settings check or
+  session before `setTrackingEnabled(context, true)`, which saves the yes
+  as `tracking_opt_in` in the SDK's `SharedPreferences`. Events tracked
+  before the yes are dropped; events right after it are queued while the
+  settings check runs. Saying no again keeps the device id;
+  `resetDeviceId()` before a yes forgets it and returns `""`.
+  `isTrackingEnabled(context)` follows the mode. `OPT_OUT` stays the
+  default.
+* **`distribution`**: a label of at most 40 characters sent on
+  `POST /session`. An invalid one is ignored with one warning.
+* **`rs_event_id`** (`RavensightEventIds` in the core): device id prefix,
+  start time, a launch nonce from `SecureRandom` and a counter, matching
+  `^[A-Za-z0-9_-]{1,64}$`. A resend carries the same ids.
+* A "Public builds" section in the README, and 25 tests (8 core, 17
+  Robolectric).
+
 ## [0.2.0] - 2026-10-10
 
 Brings the Android SDK to the same contract as every other Ravensight SDK.

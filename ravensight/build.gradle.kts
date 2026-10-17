@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.github.Reality-Software-Entertainment.ravensight-android"
-version = "0.2.0"
+version = "0.3.0"
 
 android {
     namespace = "com.realityse.ravensight"
