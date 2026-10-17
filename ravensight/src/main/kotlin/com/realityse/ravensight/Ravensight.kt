@@ -10,7 +10,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.Process
+import android.os.SystemClock
 import android.util.Log
+import android.view.Choreographer
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -193,6 +196,80 @@ object Ravensight {
                 c.track(eventName, data)
             }
         }
+
+    /**
+     * Records a real-money purchase. [amount] is whole minor units (499 is
+     * 4.99), as an integer or a string of digits. [currency] is a 3 letter
+     * code and is upper-cased. [extra] properties are merged first, so the
+     * reserved rs_ keys win. A wrong value is not rejected here: the server
+     * flags the event instead. Returns what [track] returns.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun trackPurchase(
+        amount: Any?,
+        currency: String,
+        itemType: String,
+        itemId: String,
+        cart: String? = null,
+        transactionId: String? = null,
+        extra: Map<String, Any?>? = null,
+        eventName: String = "purchase",
+    ): Boolean = track(eventName, TypedEvents.purchase(amount, currency, itemType, itemId, cart, transactionId, extra))
+
+    /**
+     * Records a resource moving. [flow] is "source" or "sink"; [amount] is a
+     * plain number. The event name defaults to resource_source or
+     * resource_sink by [flow].
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun trackResource(
+        flow: String,
+        resource: String,
+        amount: Number,
+        itemType: String? = null,
+        itemId: String? = null,
+        extra: Map<String, Any?>? = null,
+        eventName: String? = null,
+    ): Boolean = track(
+        eventName ?: "resource_$flow",
+        TypedEvents.resource(flow, resource, amount, itemType, itemId, extra),
+    )
+
+    /**
+     * Records a progression step. [status] is "start", "complete" or "fail".
+     * [p1] to [p3] name the node, coarse to fine. The event name defaults to
+     * progression_start, progression_complete or progression_fail.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun trackProgression(
+        status: String,
+        p1: String,
+        p2: String? = null,
+        p3: String? = null,
+        score: Number? = null,
+        extra: Map<String, Any?>? = null,
+        eventName: String? = null,
+    ): Boolean = track(
+        eventName ?: "progression_$status",
+        TypedEvents.progression(status, p1, p2, p3, score, extra),
+    )
+
+    /**
+     * Records an error. [severity] is "debug", "info", "warning", "error" or
+     * "critical". [message] is cut to 200 characters and [stack] to 2000.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun trackError(
+        severity: String,
+        message: String,
+        stack: String? = null,
+        extra: Map<String, Any?>? = null,
+        eventName: String = "error",
+    ): Boolean = track(eventName, TypedEvents.error(severity, message, stack, extra))
 
     /**
      * Asks for an immediate flush of anything queued. After a key refused on
@@ -463,6 +540,17 @@ object Ravensight {
 
         private val warnedReservedKeys = ConcurrentHashMap.newKeySet<String>()
 
+        // Opt-in health sampling (config.performance).
+        internal val frameSampler = FrameSampler()
+        private var frames: ChoreographerFrames? = null
+        @Volatile private var healthSent = false
+        @Volatile private var uiForeground = false
+        private val bootMs: Long? = try {
+            deps.bootMs()
+        } catch (t: Throwable) {
+            null
+        }
+
         private val pumpRunnable = Runnable { runSafely("pump") { pump() } }
         private val tickRunnable = Runnable {
             runSafely("flush timer") {
@@ -507,6 +595,9 @@ object Ravensight {
             // initialize from an Activity: its intent may carry the playtest extras.
             (context as? Activity)?.let { readPlaytestExtras(it) }
             if (deps.observeProcessLifecycle) onMain { observeProcessLifecycle() }
+            if (config.performance && (deps.frameCallbacks || deps.frameScheduler != null)) {
+                frames = ChoreographerFrames(frameSampler, deps.frameScheduler ?: ChoreographerScheduler)
+            }
         }
 
         private fun effectiveEnabled(): Boolean = enabledByGame && (isPlaytest || !optedOut)
@@ -564,12 +655,14 @@ object Ravensight {
 
         fun setEnabledByGame(enabled: Boolean) {
             enabledByGame = enabled
+            applyFrameSampling()
             active = serverAllows && effectiveEnabled()
             post("setEnabled") { applyEnabled() }
         }
 
         fun setOptedOut(value: Boolean) {
             optedOut = value
+            applyFrameSampling()
             active = serverAllows && effectiveEnabled()
             post("setTrackingEnabled") {
                 // With opt-in, the first yes is the first moment an id may exist.
@@ -639,13 +732,31 @@ object Ravensight {
             false
         }
 
+        /**
+         * Frames are sampled only while the app is in the foreground and
+         * tracking is on, so a disabled client never holds a callback. The
+         * single send per session is sendHealth's job, not this gate's.
+         */
+        private fun applyFrameSampling() {
+            if (!config.performance) return
+            onMain {
+                runSafely("frame sampling") {
+                    if (uiForeground && effectiveEnabled()) frames?.start() else frames?.stop()
+                }
+            }
+        }
+
         internal fun onForegroundSignal() {
             val now = clock()
+            uiForeground = true
+            applyFrameSampling()
             post("foreground") { foreground(now) }
         }
 
         internal fun onBackgroundSignal() {
             val now = clock()
+            uiForeground = false
+            applyFrameSampling()
             post("background") { background(now) }
         }
 
@@ -752,7 +863,19 @@ object Ravensight {
             backgroundedAtMs = now
             if (config.trackPauseEvents) core.track("game_paused", stamp(emptyMap()), now / 1000L)
             writeMarker(now)
+            sendHealth(now)
             if (config.flushOnBackground) pump()
+        }
+
+        /**
+         * One health event per session, on background entry (Android has no
+         * exit callback). Nothing is sent when no sample was taken.
+         */
+        private fun sendHealth(now: Long) {
+            if (!config.performance || healthSent || !effectiveEnabled()) return
+            val summary = frameSampler.summary() ?: return
+            val data = TypedEvents.health(summary, deps.memoryMb(), bootMs)
+            if (core.track("health", stamp(data), now / 1000L)) healthSent = true
         }
 
         /** The app stayed in the background past the timeout: close the old session. */
@@ -775,6 +898,8 @@ object Ravensight {
             core.invalidateSession()
             startedQueued = false
             exitedQueued = false
+            healthSent = false
+            frameSampler.clear()
         }
 
         private fun queueGameStarted(now: Long) {
@@ -960,6 +1085,7 @@ object Ravensight {
                 .put("deviceId", id)
                 .put("gameVersion", gameVersion)
                 .put("platform", "android")
+                .put("sdk", "android/$VERSION")
             distribution?.let { body.put("distribution", it) }
             val result = transport.request("POST", "$apiUrl/session", headers("X-API-Key" to config.ingestKey), body.toString())
             val json = result.json
@@ -1210,8 +1336,9 @@ object Ravensight {
                     } else {
                         "rs_kind \"$value\" on $eventName is not one of ${RavensightConfig.RS_KINDS.joinToString(", ")}"
                     }
-                    "rs_doctor" -> null
                     "rs_event_id" -> "rs_event_id on $eventName is set by the SDK; your value is replaced"
+                    "rs_invalid" -> "rs_invalid on $eventName is written by the server and is ignored from the SDK"
+                    in TypedEvents.KEYS -> null
                     else -> "$key on $eventName uses the reserved rs_ prefix and is not read by Ravensight"
                 }
                 if (message != null && warnedReservedKeys.add("$eventName/$key")) Log.w(TAG, message)
@@ -1225,6 +1352,8 @@ object Ravensight {
         }
 
         internal fun shutdownForTest() {
+            uiForeground = false
+            applyFrameSampling()
             (app as? Application)?.unregisterActivityLifecycleCallbacks(this)
             if (workerLazy.isInitialized()) (worker as? HandlerWorker)?.quit()
         }
@@ -1275,4 +1404,53 @@ internal class RavensightDeps(
     val registerActivityCallbacks: Boolean = true,
     /** 0 <= x < 1 for the backoff jitter. */
     val random: () -> Double = { kotlin.random.Random.nextDouble() },
+    /** Drive the Choreographer for health sampling. Tests feed frames by hand instead. */
+    val frameCallbacks: Boolean = true,
+    /** Replaces the Choreographer, so tests can see start and stop and fire frames. */
+    val frameScheduler: FrameScheduler? = null,
+    /** Used heap in MB, from Runtime. */
+    val memoryMb: () -> Double? = {
+        val rt = Runtime.getRuntime()
+        (rt.totalMemory() - rt.freeMemory()) / (1024.0 * 1024.0)
+    },
+    /** Milliseconds from process start to the SDK's start. */
+    val bootMs: () -> Long? = { SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime() },
 )
+
+/** Where frame callbacks are scheduled. The Choreographer in production. */
+internal interface FrameScheduler {
+    fun post(callback: Choreographer.FrameCallback)
+    fun remove(callback: Choreographer.FrameCallback)
+}
+
+internal object ChoreographerScheduler : FrameScheduler {
+    override fun post(callback: Choreographer.FrameCallback) = Choreographer.getInstance().postFrameCallback(callback)
+    override fun remove(callback: Choreographer.FrameCallback) = Choreographer.getInstance().removeFrameCallback(callback)
+}
+
+/** A frame callback that feeds a [FrameSampler]. Main thread only. */
+internal class ChoreographerFrames(
+    private val sampler: FrameSampler,
+    private val scheduler: FrameScheduler,
+) : Choreographer.FrameCallback {
+    private var running = false
+
+    fun start() {
+        if (running) return
+        running = true
+        sampler.resetWindow()
+        scheduler.post(this)
+    }
+
+    fun stop() {
+        if (!running) return
+        running = false
+        scheduler.remove(this)
+    }
+
+    override fun doFrame(frameTimeNanos: Long) {
+        if (!running) return
+        sampler.onFrame(frameTimeNanos)
+        scheduler.post(this)
+    }
+}
