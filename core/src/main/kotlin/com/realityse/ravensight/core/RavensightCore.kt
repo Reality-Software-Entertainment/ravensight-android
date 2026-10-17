@@ -1,5 +1,7 @@
 package com.realityse.ravensight.core
 
+import kotlin.random.Random
+
 /**
  * One queued analytics event. [data] values may be strings, numbers, booleans,
  * nulls, nested maps or lists; the transport layer serializes them to JSON.
@@ -16,10 +18,16 @@ class RavensightEvent(
  * is one of these, or null when nothing is wrong.
  */
 object RavensightReason {
+    /** No ingest key: the SDK is inert for the run. */
+    const val NO_KEY: String = "no_key"
+
     /** Turned off by the game (`enabled = false`) or by the player's saved opt-out. */
     const val DISABLED: String = "disabled"
 
-    /** The ingest key was refused (401, or a 403 that is not one of the others). */
+    /**
+     * The ingest key was refused (401, or a 403 that is not one of the
+     * others). On the settings check or a session open it ends the run.
+     */
     const val INVALID_KEY: String = "invalid_key"
 
     /** The server switched tracking off for this game. Permanent for the run. */
@@ -67,12 +75,18 @@ class RavensightCoreConfig(
     val maxBackoffMs: Long = MAX_BACKOFF_MS,
     /** A session this close to expiry is treated as already expired. */
     val sessionExpirySkewMs: Long = 5_000L,
+    /** 0 <= x < 1, for the backoff jitter. Tests fix it; 0.5 is no jitter. */
+    val random: () -> Double = { Random.nextDouble() },
 ) {
     companion object {
         const val MAX_BATCH_SIZE: Int = 50
         const val DEFAULT_QUEUE_CAP: Int = 500
         const val DEFAULT_RETRY_MS: Long = 10_000L
         const val MAX_BACKOFF_MS: Long = 300_000L
+
+        /** Retry waits without a Retry-After vary by this fraction either way. */
+        const val BACKOFF_JITTER: Double = 0.2
+        const val MIN_RETRY_MS: Long = 500L
     }
 }
 
@@ -332,6 +346,22 @@ class RavensightCore(
         return reason
     }
 
+    /**
+     * The key was refused by the settings check or a session open (401, or a
+     * 403 that is not the kill switch or a playtest refusal): retrying cannot
+     * help, so the run ends. The queue is cleared and [nextAction] answers
+     * Idle from now on, an explicit flush ([retryOnce]) included.
+     */
+    private fun refuseKeyForRun() {
+        keyRefused = true
+        stopForRun(RavensightReason.INVALID_KEY)
+    }
+
+    /** Counts events dropped before they reached the queue (the 8 KB cap). */
+    fun countDropped(count: Int) {
+        dropped += count.coerceAtLeast(0)
+    }
+
     /** Discards everything queued, counting it as dropped. */
     fun clearQueue() {
         dropped += queue.size
@@ -387,7 +417,7 @@ class RavensightCore(
     ): Boolean {
         val refusal = RavensightReason.forRefusal(status, errorCode)
         if (refusal != null) {
-            onRefused(refusal)
+            if (refusal == RavensightReason.INVALID_KEY) refuseKeyForRun() else onRefused(refusal)
             return trackingEnabled
         }
         if (status == 429 || (status == 503 && retryAfterSec != null)) {
@@ -435,6 +465,10 @@ class RavensightCore(
         }
 
         RavensightReason.forRefusal(status, errorCode)?.let {
+            if (it == RavensightReason.INVALID_KEY) {
+                refuseKeyForRun()
+                return SessionOutcome.Refused(it)
+            }
             return SessionOutcome.Refused(onRefused(it))
         }
 
@@ -541,13 +575,21 @@ class RavensightCore(
 
     /**
      * Blocks network attempts for [explicitWaitMs] when the server said how
-     * long (Retry-After), otherwise for the current backoff delay. Either way
-     * the stored backoff doubles up to the ceiling, matching the Godot SDK.
+     * long (Retry-After, obeyed exactly), otherwise for the current backoff
+     * delay with plus or minus 20 percent jitter, never past the ceiling.
+     * Either way the stored backoff doubles up to the ceiling, matching the
+     * Godot SDK, and no wait is shorter than half a second.
      */
     private fun scheduleRetry(explicitWaitMs: Long?) {
-        val wait = if (explicitWaitMs != null && explicitWaitMs > 0) explicitWaitMs else backoffMs
+        val wait = if (explicitWaitMs != null && explicitWaitMs > 0) {
+            explicitWaitMs
+        } else {
+            val roll = config.random().coerceIn(0.0, 1.0)
+            val factor = 1 - RavensightCoreConfig.BACKOFF_JITTER + 2 * RavensightCoreConfig.BACKOFF_JITTER * roll
+            Math.round(backoffMs * factor).coerceAtMost(config.maxBackoffMs)
+        }
         backoffMs = (backoffMs * 2).coerceAtMost(config.maxBackoffMs)
-        nextAttemptAtMs = nowMs() + wait.coerceAtLeast(500L)
+        nextAttemptAtMs = nowMs() + wait.coerceAtLeast(RavensightCoreConfig.MIN_RETRY_MS)
     }
 
     private fun httpReason(status: Int): String =

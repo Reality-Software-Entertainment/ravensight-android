@@ -7,11 +7,12 @@ import com.realityse.ravensight.core.RavensightCoreConfig
  */
 class RavensightConfig @JvmOverloads constructor(
     /**
-     * Your game's PUBLISHABLE ingest key (format: gt_live_...), copied from
+     * Your game's PUBLISHABLE ingest key (format: gt_live_..., or a
+     * gt_pub_... public key for a build anyone can download), copied from
      * the Ravensight dashboard. Safe to ship inside your APK: it can open
      * sessions, read the tracking kill switch and read this game's design
      * suggestions. It cannot read analytics, read feedback or touch your
-     * account.
+     * account. Blank makes the SDK inert for the run: see [optional].
      */
     val ingestKey: String,
     /**
@@ -69,6 +70,29 @@ class RavensightConfig @JvmOverloads constructor(
     val playtestToken: String? = null,
     /** Ravensight Playtest run id, paired with [playtestToken]. */
     val playtestRunId: String? = null,
+    /**
+     * True silences the one warning a blank [ingestKey] logs. Without a key
+     * the SDK is inert either way: nothing is saved, no worker thread is
+     * started, no request is made, no lifecycle callback is registered and
+     * [Ravensight.statusReason] is "no_key". For a public build whose key is
+     * injected at build time and may be absent.
+     */
+    val optional: Boolean = false,
+    /**
+     * Whether the player must say yes first. [RavensightConsent.OPT_OUT]
+     * (the default) collects until the player opts out.
+     * [RavensightConsent.OPT_IN] creates no device id and makes no request
+     * until [Ravensight.setTrackingEnabled] is called with true; events
+     * tracked before that yes are dropped, not held.
+     */
+    val consent: RavensightConsent = RavensightConsent.OPT_OUT,
+    /**
+     * A short label for where this build was distributed (for example
+     * "play-store" or "itch"), sent on POST /session. At most 40 characters
+     * with no control characters, surrounding whitespace trimmed; anything
+     * else is ignored with one warning.
+     */
+    val distribution: String? = null,
 ) {
     companion object {
         /** The bare host; "/api/v1" is appended by [normalizeApiUrl]. */
@@ -99,6 +123,15 @@ class RavensightConfig @JvmOverloads constructor(
     }
 }
 
+/** When collection may start. See [RavensightConfig.consent]. */
+enum class RavensightConsent {
+    /** Collect until the player opts out. The default, and the behaviour of every release before 0.3.0. */
+    OPT_OUT,
+
+    /** Collect nothing until the player opts in. The yes is saved in the SDK's SharedPreferences. */
+    OPT_IN,
+}
+
 /**
  * Optional observer for SDK activity. Every method has a default empty body;
  * override only what you need. Callbacks are delivered on the main thread.
@@ -112,13 +145,13 @@ interface RavensightListener {
 
     /**
      * Tracking was switched off: "server" when the kill switch is on for
-     * your game, "player" after a saved opt-out.
+     * your game, "player" after a saved opt-out (or a withdrawn opt-in).
      */
     fun onTrackingDisabled(source: String) {}
 
     /**
      * The SDK's status changed. [reason] is null when delivery is healthy,
-     * otherwise one of "disabled", "invalid_key", "tracking_disabled",
+     * otherwise one of "no_key", "disabled", "invalid_key", "tracking_disabled",
      * "offline", "rate_limited", "session_failed", "playtest_job_closed".
      * The same value is readable at any time as [Ravensight.statusReason].
      */
@@ -127,7 +160,11 @@ interface RavensightListener {
     /** A batch of events was accepted by the server. */
     fun onEventsFlushed(count: Int) {}
 
-    /** A batch flush attempt failed (it will be retried automatically). */
+    /**
+     * A batch flush attempt failed (it will be retried automatically). Also
+     * "event_too_large" for an event whose data was over 8,192 bytes as
+     * JSON: that event was dropped when tracked and is never sent.
+     */
     fun onFlushFailed(reason: String) {}
 
     /** A feedback submission was accepted. */

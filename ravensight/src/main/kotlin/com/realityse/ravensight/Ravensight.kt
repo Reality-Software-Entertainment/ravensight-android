@@ -20,10 +20,13 @@ import com.realityse.ravensight.core.RavensightAction
 import com.realityse.ravensight.core.RavensightCore
 import com.realityse.ravensight.core.RavensightCoreConfig
 import com.realityse.ravensight.core.RavensightEvent
+import com.realityse.ravensight.core.RavensightEventIds
+import com.realityse.ravensight.core.RavensightLimits
 import com.realityse.ravensight.core.RavensightReason
 import com.realityse.ravensight.core.SessionOutcome
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -42,12 +45,14 @@ import org.json.JSONObject
 object Ravensight {
 
     /** This SDK's version. */
-    const val VERSION: String = "0.2.0"
+    const val VERSION: String = "0.3.0"
 
     internal const val TAG = "Ravensight"
     internal const val PREFS = "ravensight"
     internal const val KEY_DEVICE_ID = "device_id"
     internal const val KEY_OPT_OUT = "tracking_opt_out"
+    /** The player's yes with [RavensightConsent.OPT_IN]. */
+    internal const val KEY_OPT_IN = "tracking_opt_in"
     internal const val KEY_MARKER_TOKEN = "exit_marker_token"
     internal const val KEY_MARKER_EXPIRES_AT = "exit_marker_expires_at_ms"
     internal const val KEY_MARKER_BACKGROUNDED_AT = "exit_marker_backgrounded_at_ms"
@@ -82,8 +87,10 @@ object Ravensight {
         get() = controller?.ready ?: false
 
     /**
-     * True while events are accepted: not disabled by the game, not opted
-     * out by the player, not switched off by the server and not stopped.
+     * True while events are accepted: initialized with a key, not disabled
+     * by the game, not opted out by the player (and, with
+     * [RavensightConsent.OPT_IN], opted in), not switched off by the server
+     * and not stopped. False while inert.
      */
     @JvmStatic
     val isEnabled: Boolean
@@ -93,14 +100,16 @@ object Ravensight {
      * The anonymous device id reported to the server. Null before
      * [initialize], and null until the first Activity is created (the SDK
      * first checks whether this is a playtest run, whose id is never saved).
+     * With [RavensightConsent.OPT_IN] no id is created before the player's
+     * first yes, and while inert none is ever created.
      */
     @JvmStatic
     val deviceId: String?
         get() = controller?.deviceId
 
     /**
-     * Why the SDK is not delivering, or null when it is healthy: "disabled",
-     * "invalid_key", "tracking_disabled", "offline", "rate_limited",
+     * Why the SDK is not delivering, or null when it is healthy: "no_key"
+     * (inert, a blank ingest key), "disabled", "invalid_key", "tracking_disabled", "offline", "rate_limited",
      * "session_failed" or "playtest_job_closed". Changes are reported through
      * [RavensightListener.onStatusChanged].
      */
@@ -125,8 +134,10 @@ object Ravensight {
     /**
      * Starts the SDK. Call once, from Application.onCreate. Events tracked
      * before the session is ready are queued. Extra calls are ignored. A
-     * blank ingest key logs an error and leaves the SDK stopped with
-     * [statusReason] "invalid_key"; it never throws.
+     * blank ingest key leaves the SDK inert for the run: nothing saved, no
+     * worker thread, no request, no lifecycle callback, [statusReason]
+     * "no_key" and one warning unless [RavensightConfig.optional] is true.
+     * It never throws.
      */
     @JvmStatic
     @JvmOverloads
@@ -184,8 +195,9 @@ object Ravensight {
         }
 
     /**
-     * Asks for an immediate flush of anything queued. After a refused key
-     * this makes exactly one more attempt.
+     * Asks for an immediate flush of anything queued. After a key refused on
+     * a batch this makes exactly one more attempt; a key refused by the
+     * settings check or a session open has ended the run.
      */
     @JvmStatic
     fun flush() = safely("flush") { controller?.requestFlush() }
@@ -239,6 +251,13 @@ object Ravensight {
      * SDK reads it at start). Turning it off clears anything queued and stops
      * sending. A saved opt-out wins over `enabled = true`. Ignored, with one
      * log line, during a playtest run.
+     *
+     * With [RavensightConsent.OPT_IN], true is the player's yes: it is saved
+     * (as "tracking_opt_in"), the device id is created if there is none yet
+     * and the SDK starts; events tracked right after it are queued while the
+     * settings check runs. False withdraws it and keeps the device id
+     * ([resetDeviceId] forgets it). Called before [initialize], the consent
+     * mode is not known yet, so the choice is saved both ways.
      */
     @JvmStatic
     fun setTrackingEnabled(context: Context, enabled: Boolean) = safely("setTrackingEnabled") {
@@ -248,21 +267,38 @@ object Ravensight {
                 Log.i(TAG, "setTrackingEnabled ignored during a playtest run")
                 return@synchronized
             }
-            prefs(context).edit().putBoolean(KEY_OPT_OUT, !enabled).commit()
+            val edit = prefs(context).edit().putBoolean(KEY_OPT_OUT, !enabled)
+            if (c == null || c.consent == RavensightConsent.OPT_IN) {
+                if (enabled) edit.putBoolean(KEY_OPT_IN, true) else edit.remove(KEY_OPT_IN)
+            }
+            edit.commit()
             c?.setOptedOut(!enabled)
         }
     }
 
-    /** The player's saved analytics choice: false after `setTrackingEnabled(context, false)`. */
+    /**
+     * The player's saved analytics choice: false after
+     * `setTrackingEnabled(context, false)`, and, once initialized with
+     * [RavensightConsent.OPT_IN], false until the player's yes.
+     */
     @JvmStatic
     fun isTrackingEnabled(context: Context): Boolean =
-        safely("isTrackingEnabled", true) { !prefs(context).getBoolean(KEY_OPT_OUT, false) }
+        safely("isTrackingEnabled", true) {
+            val c = controller
+            if (c != null && c.consent == RavensightConsent.OPT_IN) {
+                prefs(context).getBoolean(KEY_OPT_IN, false)
+            } else {
+                !prefs(context).getBoolean(KEY_OPT_OUT, false)
+            }
+        }
 
     /**
      * Forgets this install's analytics identity: mints and saves a new random
      * id, clears the queue, ends the session and returns the new id. Returns
      * "" before [initialize]; use the overload with a Context there. Ignored,
-     * with one log line, during a playtest run.
+     * with one log line, during a playtest run. While inert, or with
+     * [RavensightConsent.OPT_IN] before the player's yes, it forgets the
+     * saved id without making a new one and returns "".
      */
     @JvmStatic
     fun resetDeviceId(): String = safely("resetDeviceId", "") {
@@ -332,10 +368,13 @@ object Ravensight {
     private val random = SecureRandom()
 
     /** "dev_" plus 32 hex characters from 16 bytes of the platform CSPRNG. */
-    internal fun newDeviceId(): String {
-        val bytes = ByteArray(16)
+    internal fun newDeviceId(): String = "dev_" + randomHex(16)
+
+    /** [byteCount] bytes from SecureRandom as lowercase hex. */
+    internal fun randomHex(byteCount: Int): String {
+        val bytes = ByteArray(byteCount)
         synchronized(random) { random.nextBytes(bytes) }
-        return "dev_" + bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        return RavensightEventIds.hex(bytes)
     }
 
     private inline fun <T> safely(what: String, fallback: T, block: () -> T): T = try {
@@ -358,9 +397,15 @@ object Ravensight {
         pendingPlaytest: Pair<String, String?>?,
     ) : Application.ActivityLifecycleCallbacks {
 
+        /** A blank key: inert for the run, no thread, no file, no request. */
+        private val inert = config.ingestKey.isBlank()
+        internal val consent: RavensightConsent = config.consent
+
         private val apiUrl = RavensightConfig.normalizeApiUrl(config.apiUrl)
         private val transport: RavensightTransport = deps.transport ?: RavensightHttp(config.requestTimeoutMs)
-        private val worker: RavensightWorker = deps.worker ?: HandlerWorker()
+        /** Created on first use, so an inert SDK never starts a HandlerThread. */
+        private val workerLazy = lazy { deps.worker ?: HandlerWorker() }
+        private val worker: RavensightWorker by workerLazy
         private val mainPost: (Runnable) -> Unit = deps.mainPost ?: run {
             val main = Handler(Looper.getMainLooper())
             val post: (Runnable) -> Unit = { main.post(it) }
@@ -372,8 +417,17 @@ object Ravensight {
 
         /** Owned by the worker thread after construction; never touched from any other thread. */
         private val core = RavensightCore(
-            RavensightCoreConfig(maxQueueSize = config.maxQueueSize),
+            RavensightCoreConfig(maxQueueSize = config.maxQueueSize, random = deps.random),
         ) { clock() }
+
+        private val distribution = RavensightLimits.validDistribution(config.distribution)
+
+        /** rs_event_id: a launch nonce from SecureRandom, the start time and a counter. */
+        private val eventIds = RavensightEventIds(randomHex(4), clock() / 1000L)
+
+        /** The id prefix used until the device id is known (before the first Activity). */
+        private val launchPrefix: String by lazy { randomHex(8) }
+        private val warnedTooLarge = AtomicBoolean(false)
 
         // Mirrors read from any thread.
         @Volatile var deviceId: String? = null
@@ -385,7 +439,7 @@ object Ravensight {
 
         // Set from any thread, read on the worker.
         @Volatile private var enabledByGame: Boolean = pendingEnabled ?: config.enabled
-        @Volatile private var optedOut: Boolean = prefs.getBoolean(KEY_OPT_OUT, false)
+        @Volatile private var optedOut: Boolean = !savedChoice()
 
         /** Mirror: the server and the run still allow sending (no kill switch, no stop). */
         @Volatile private var serverAllows = true
@@ -421,20 +475,34 @@ object Ravensight {
         private val tickRunnableRef: Runnable get() = tickRunnable
 
         init {
-            if (config.ingestKey.isBlank()) {
-                Log.e(TAG, "Ravensight: ingestKey is required (your gt_live_... key); sending stopped for this run")
-                core.stopForRun(RavensightReason.INVALID_KEY)
-            }
-            val token = config.playtestToken?.takeIf { it.isNotBlank() }
-            when {
-                token != null -> choosePlaytest(token, config.playtestRunId, "config")
-                pendingPlaytest != null -> choosePlaytest(pendingPlaytest.first, pendingPlaytest.second, "setPlaytestContext")
+            if (inert) {
+                if (!config.optional) {
+                    Log.w(TAG, "Ravensight: no ingest key (no_key), the SDK is inert for this run: nothing is saved or sent. Set optional = true to silence this line.")
+                }
+                core.stopForRun(RavensightReason.NO_KEY)
+            } else {
+                val token = config.playtestToken?.takeIf { it.isNotBlank() }
+                when {
+                    token != null -> choosePlaytest(token, config.playtestRunId, "config")
+                    pendingPlaytest != null -> choosePlaytest(pendingPlaytest.first, pendingPlaytest.second, "setPlaytestContext")
+                }
+                if (!config.distribution.isNullOrBlank() && distribution == null) {
+                    Log.w(TAG, "distribution ignored: it must be at most ${RavensightLimits.MAX_DISTRIBUTION_LENGTH} characters with no control characters")
+                }
             }
             core.setEnabled(effectiveEnabled())
             publish()
         }
 
+        /** The player's saved choice in this consent mode: true when tracking may run. */
+        private fun savedChoice(): Boolean = when (consent) {
+            RavensightConsent.OPT_OUT -> !prefs.getBoolean(KEY_OPT_OUT, false)
+            RavensightConsent.OPT_IN -> prefs.getBoolean(KEY_OPT_IN, false)
+        }
+
         fun start(context: Context) {
+            // Inert: no lifecycle callback, no observer, no worker message.
+            if (inert) return
             if (deps.registerActivityCallbacks) (app as? Application)?.registerActivityLifecycleCallbacks(this)
             // initialize from an Activity: its intent may carry the playtest extras.
             (context as? Activity)?.let { readPlaytestExtras(it) }
@@ -456,7 +524,7 @@ object Ravensight {
             // later mutation of the caller's map cannot race the worker, and a
             // value that cannot be serialized fails this call instead of
             // blocking every batch behind it.
-            val snapshot: Map<String, Any?> = if (data.isEmpty()) {
+            val plain: Map<String, Any?> = if (data.isEmpty()) {
                 emptyMap()
             } else {
                 try {
@@ -467,7 +535,19 @@ object Ravensight {
                     return false
                 }
             }
-            checkReservedKeys(eventName, snapshot)
+            checkReservedKeys(eventName, plain)
+            // Every event carries an rs_event_id, stamped now so a resend of
+            // the same batch carries the same id. A value of the caller's
+            // under that key is replaced.
+            val snapshot = stamp(plain)
+            if (eventBytes(snapshot) > RavensightLimits.MAX_EVENT_BYTES) {
+                if (warnedTooLarge.compareAndSet(false, true)) {
+                    Log.w(TAG, "dropped event \"$eventName\": its data is larger than ${RavensightLimits.MAX_EVENT_BYTES} bytes as JSON (later drops are counted, not logged)")
+                }
+                post("event_too_large") { core.countDropped(1) }
+                emit { it.onFlushFailed("event_too_large") }
+                return false
+            }
             post("track") {
                 core.track(eventName, snapshot, at)
                 if (core.queueSize >= RavensightCoreConfig.MAX_BATCH_SIZE) pump()
@@ -492,6 +572,8 @@ object Ravensight {
             optedOut = value
             active = serverAllows && effectiveEnabled()
             post("setTrackingEnabled") {
+                // With opt-in, the first yes is the first moment an id may exist.
+                if (!value && foregrounded) resolveDeviceId()
                 applyEnabled()
                 if (value) emit { it.onTrackingDisabled("player") }
             }
@@ -501,6 +583,17 @@ object Ravensight {
             if (isPlaytest) {
                 Log.i(TAG, "resetDeviceId ignored during a playtest run")
                 return deviceId ?: ""
+            }
+            if (inert || (consent == RavensightConsent.OPT_IN && optedOut)) {
+                // Not opted in (or inert): forget any saved id, make none.
+                prefs.edit().remove(KEY_DEVICE_ID).commit()
+                deviceId = null
+                post("resetDeviceId") {
+                    core.clearQueue()
+                    core.invalidateSession()
+                    deleteMarker()
+                }
+                return ""
             }
             val id = newDeviceId()
             prefs.edit().putString(KEY_DEVICE_ID, id).commit()
@@ -633,7 +726,7 @@ object Ravensight {
                 endSessionAfterBackground(backgroundedAt)
                 queueGameStarted(now)
             } else if (backgroundedAt != null && config.trackPauseEvents) {
-                core.track("game_resumed", emptyMap(), now / 1000L)
+                core.track("game_resumed", stamp(emptyMap()), now / 1000L)
             }
             if (core.isActive) scheduleTick()
             pump()
@@ -657,7 +750,7 @@ object Ravensight {
             inForeground = false
             if (!foregrounded) return
             backgroundedAtMs = now
-            if (config.trackPauseEvents) core.track("game_paused", emptyMap(), now / 1000L)
+            if (config.trackPauseEvents) core.track("game_paused", stamp(emptyMap()), now / 1000L)
             writeMarker(now)
             if (config.flushOnBackground) pump()
         }
@@ -689,7 +782,7 @@ object Ravensight {
             startedQueued = true
             // First in the queue, so nothing tracked before the foreground
             // (a push handler, say) lands ahead of the session's start.
-            core.track("game_started", emptyMap(), now / 1000L, atHead = true)
+            core.track("game_started", stamp(emptyMap()), now / 1000L, atHead = true)
         }
 
         private fun applyEnabled() {
@@ -721,11 +814,29 @@ object Ravensight {
             verbose("playtest run ${runId.trim()} from $source")
         }
 
+        /**
+         * Loads the saved id, or makes and saves one. Never while inert, and
+         * with [RavensightConsent.OPT_IN] none is made before the player's
+         * yes (an id an earlier yes saved is still read).
+         */
         private fun resolveDeviceId() {
-            if (deviceId != null || isPlaytest) return
+            if (deviceId != null || isPlaytest || inert) return
             val saved = prefs.getString(KEY_DEVICE_ID, null)?.takeIf { it.isNotEmpty() }
+            if (saved == null && consent == RavensightConsent.OPT_IN && optedOut) return
             deviceId = saved ?: newDeviceId().also { prefs.edit().putString(KEY_DEVICE_ID, it).commit() }
         }
+
+        /** A copy of [data] carrying the next rs_event_id. */
+        private fun stamp(data: Map<String, Any?>): Map<String, Any?> {
+            val prefix = deviceId?.let { RavensightEventIds.prefixFor(it) } ?: launchPrefix
+            val copy = LinkedHashMap(data)
+            copy[RavensightLimits.EVENT_ID_KEY] = eventIds.next(prefix)
+            return copy
+        }
+
+        /** The size of an event's data as JSON in UTF-8 bytes, slashes unescaped as the server measures it. */
+        private fun eventBytes(data: Map<String, Any?>): Int =
+            RavensightJson.toJsonValue(data).toString().replace("\\/", "/").toByteArray(Charsets.UTF_8).size
 
         // --- The exit marker ----------------------------------------------------
 
@@ -771,7 +882,7 @@ object Ravensight {
         private fun postGameExited(token: String, backgroundedAt: Long): HttpResult {
             val event = JSONObject()
                 .put("event", "game_exited")
-                .put("data", JSONObject())
+                .put("data", RavensightJson.toJsonValue(stamp(emptyMap())))
                 .put("timestamp", backgroundedAt / 1000L)
             val body = JSONObject().put("events", JSONArray().put(event))
             return transport.request("POST", "$apiUrl/track/batch", headers("X-Session-Token" to token), body.toString())
@@ -849,6 +960,7 @@ object Ravensight {
                 .put("deviceId", id)
                 .put("gameVersion", gameVersion)
                 .put("platform", "android")
+            distribution?.let { body.put("distribution", it) }
             val result = transport.request("POST", "$apiUrl/session", headers("X-API-Key" to config.ingestKey), body.toString())
             val json = result.json
             val outcome = core.onSessionResult(
@@ -923,7 +1035,7 @@ object Ravensight {
             when (reason) {
                 RavensightReason.INVALID_KEY -> {
                     stopTick()
-                    logOnce(reason, Log.WARN, "Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.")
+                    logOnce(reason, Log.WARN, "Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ or gt_pub_ key.")
                 }
                 RavensightReason.TRACKING_DISABLED -> {
                     stopTick()
@@ -1039,6 +1151,7 @@ object Ravensight {
 
         /** Runs [body] on the worker; nothing it throws can reach the looper. */
         private fun post(what: String, body: () -> Unit) {
+            if (inert) return
             worker.post(Runnable { runSafely(what, body) })
         }
 
@@ -1098,6 +1211,7 @@ object Ravensight {
                         "rs_kind \"$value\" on $eventName is not one of ${RavensightConfig.RS_KINDS.joinToString(", ")}"
                     }
                     "rs_doctor" -> null
+                    "rs_event_id" -> "rs_event_id on $eventName is set by the SDK; your value is replaced"
                     else -> "$key on $eventName uses the reserved rs_ prefix and is not read by Ravensight"
                 }
                 if (message != null && warnedReservedKeys.add("$eventName/$key")) Log.w(TAG, message)
@@ -1112,8 +1226,15 @@ object Ravensight {
 
         internal fun shutdownForTest() {
             (app as? Application)?.unregisterActivityLifecycleCallbacks(this)
-            (worker as? HandlerWorker)?.quit()
+            if (workerLazy.isInitialized()) (worker as? HandlerWorker)?.quit()
         }
+
+        internal fun queueSizeForTest(): Int = core.queueSize
+        internal fun droppedForTest(): Long = core.stats.dropped
+
+        /** Test hook: whether the worker (a HandlerThread in production) was ever created. */
+        internal val workerCreatedForTest: Boolean
+            get() = workerLazy.isInitialized()
     }
 
     private const val MAX_DRAIN_STEPS = 20
@@ -1152,4 +1273,6 @@ internal class RavensightDeps(
     val env: (String) -> String? = { System.getenv(it) },
     val observeProcessLifecycle: Boolean = true,
     val registerActivityCallbacks: Boolean = true,
+    /** 0 <= x < 1 for the backoff jitter. */
+    val random: () -> Double = { kotlin.random.Random.nextDouble() },
 )

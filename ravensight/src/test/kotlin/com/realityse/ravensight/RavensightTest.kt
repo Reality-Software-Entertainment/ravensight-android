@@ -62,6 +62,9 @@ class RavensightTest {
         playtestRunId: String? = null,
         ingestKey: String = "gt_live_test",
         verbose: Boolean = false,
+        optional: Boolean = false,
+        consent: RavensightConsent = RavensightConsent.OPT_OUT,
+        distribution: String? = null,
     ) = RavensightConfig(
         ingestKey = ingestKey,
         apiUrl = "https://api.example.test/",
@@ -71,6 +74,9 @@ class RavensightTest {
         playtestToken = playtestToken,
         playtestRunId = playtestRunId,
         verboseLogging = verbose,
+        optional = optional,
+        consent = consent,
+        distribution = distribution,
     )
 
     private fun init(cfg: RavensightConfig = config(), activityCallbacks: Boolean = false) {
@@ -84,10 +90,14 @@ class RavensightTest {
                 env = { env[it] },
                 observeProcessLifecycle = false,
                 registerActivityCallbacks = activityCallbacks,
+                random = { random },
             ),
         )
         worker.runDue()
     }
+
+    /** The backoff jitter roll; 0.5 is no jitter. */
+    private var random = 0.5
 
     private val controller get() = Ravensight.controllerForTest!!
 
@@ -152,7 +162,7 @@ class RavensightTest {
         Ravensight.flush()
         worker.runDue()
         assertEquals(0, http.requests.size)
-        assertEquals("invalid_key", Ravensight.statusReason)
+        assertEquals("no_key", Ravensight.statusReason)
     }
 
     @Test
@@ -530,7 +540,8 @@ class RavensightTest {
         assertEquals(1, events.length())
         assertEquals("game_exited", events.getJSONObject(0).getString("event"))
         assertEquals((now - 120_000L) / 1000, events.getJSONObject(0).getLong("timestamp"))
-        assertEquals(0, events.getJSONObject(0).getJSONObject("data").length())
+        val exitData = events.getJSONObject(0).getJSONObject("data")
+        assertEquals(listOf("rs_event_id"), exitData.keys().asSequence().toList()) // nothing but its id
         assertEquals(listOf("/track/batch", "/settings", "/session", "/track/batch"), http.paths())
         assertFalse(prefs().contains(Ravensight.KEY_MARKER_TOKEN))
     }
@@ -612,16 +623,16 @@ class RavensightTest {
         assertEquals(listOf("/settings"), http.paths())
         assertEquals("invalid_key", Ravensight.statusReason)
         val logs = ShadowLog.getLogsForTag("Ravensight").filter {
-            it.msg == "Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key."
+            it.msg == "Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ or gt_pub_ key."
         }
         assertEquals(1, logs.size)
         assertTrue(listener.statuses.contains("invalid_key"))
-        // An explicit flush makes exactly one more attempt.
+        // The run is over: not even an explicit flush tries again.
+        assertFalse(Ravensight.track("after"))
         Ravensight.flush()
         worker.runDue()
-        assertEquals(listOf("/settings", "/settings"), http.paths())
         advance(60 * 60_000L)
-        assertEquals(2, http.requests.size)
+        assertEquals(listOf("/settings"), http.paths())
     }
 
     @Test
@@ -936,8 +947,288 @@ class RavensightTest {
     }
 
     @Test
-    fun `the version constant is 0_2_0`() {
-        assertEquals("0.2.0", Ravensight.VERSION)
+    fun `the version constant is 0_3_0`() {
+        assertEquals("0.3.0", Ravensight.VERSION)
+    }
+
+    // --- 0.3.0 public build rules ------------------------------------------
+
+    private fun sessionBody(): JSONObject? =
+        http.requests.lastOrNull { it.path == "/session" }?.body?.let { JSONObject(it) }
+
+    @Test
+    fun `a blank key is inert, starts no worker and saves nothing`() {
+        init(config(ingestKey = ""), activityCallbacks = true)
+        val c = controller
+        assertFalse(Ravensight.track("e", mapOf("a" to 1)))
+        Ravensight.flush()
+        Ravensight.submitFeedback("hello")
+        Ravensight.fetchSuggestions()
+        Ravensight.setEnabled(true)
+        c.onForegroundSignal()
+        Robolectric.buildActivity(Activity::class.java).setup()
+        worker.runDue()
+        assertFalse("no worker, so no thread and no timer", c.workerCreatedForTest)
+        assertEquals(0, http.requests.size)
+        assertFalse(Ravensight.isEnabled)
+        assertEquals("no_key", Ravensight.statusReason)
+        assertNull(Ravensight.deviceId)
+        assertTrue("nothing saved", prefs().all.isEmpty())
+        assertEquals(1, ShadowLog.getLogsForTag("Ravensight").count { it.msg.contains("no_key") })
+        assertEquals("", Ravensight.resetDeviceId())
+        assertTrue(prefs().all.isEmpty())
+    }
+
+    @Test
+    fun `optional silences the inert warning`() {
+        init(config(ingestKey = " ", optional = true))
+        assertEquals("no_key", Ravensight.statusReason)
+        assertEquals(0, ShadowLog.getLogsForTag("Ravensight").count { it.msg.contains("no_key") })
+    }
+
+    @Test
+    fun `a key-only caller saves only the device id, as before`() {
+        init()
+        foreground()
+        Ravensight.track("e")
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals(setOf(Ravensight.KEY_DEVICE_ID), prefs().all.keys)
+        assertFalse(sessionBody()!!.has("distribution"))
+    }
+
+    @Test
+    fun `opt-in sends nothing and makes no id before the yes`() {
+        init(config(consent = RavensightConsent.OPT_IN))
+        foreground()
+        assertFalse(Ravensight.track("before_yes"))
+        Ravensight.flush()
+        advance(60_000L)
+        assertEquals(0, http.requests.size)
+        assertNull(Ravensight.deviceId)
+        assertTrue(prefs().all.isEmpty())
+        assertFalse(Ravensight.isEnabled)
+        assertFalse(Ravensight.isTrackingEnabled(app))
+        assertEquals("disabled", Ravensight.statusReason)
+    }
+
+    @Test
+    fun `the opt-in yes is saved, makes the id and queues events tracked right after`() {
+        init(config(consent = RavensightConsent.OPT_IN))
+        foreground()
+        Ravensight.setTrackingEnabled(app, true)
+        assertTrue(prefs().getBoolean(Ravensight.KEY_OPT_IN, false))
+        assertTrue(Ravensight.track("right_after_yes")) // before the worker has run the yes
+        worker.runDue()
+        Ravensight.flush()
+        worker.runDue()
+        val id = Ravensight.deviceId!!
+        assertTrue(id.startsWith("dev_"))
+        assertEquals(id, prefs().getString(Ravensight.KEY_DEVICE_ID, null))
+        assertEquals(listOf("/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("game_started", "right_after_yes"), eventNames())
+        assertEquals(id, sessionBody()!!.getString("deviceId"))
+        assertTrue(Ravensight.isTrackingEnabled(app))
+
+        // The next launch remembers the yes.
+        Ravensight.resetForTest()
+        http.requests.clear()
+        init(config(consent = RavensightConsent.OPT_IN))
+        foreground()
+        assertTrue(Ravensight.isEnabled)
+        assertEquals(id, Ravensight.deviceId)
+    }
+
+    @Test
+    fun `withdrawing the opt-in keeps the id and reset forgets it without a new one`() {
+        init(config(consent = RavensightConsent.OPT_IN))
+        foreground()
+        Ravensight.setTrackingEnabled(app, true)
+        worker.runDue()
+        val id = Ravensight.deviceId!!
+        Ravensight.setTrackingEnabled(app, false)
+        worker.runDue()
+        assertFalse(prefs().contains(Ravensight.KEY_OPT_IN))
+        assertEquals(id, prefs().getString(Ravensight.KEY_DEVICE_ID, null))
+        assertEquals(id, Ravensight.deviceId)
+        assertTrue(listener.trackingDisabled.contains("player"))
+        val before = http.requests.size
+        assertFalse(Ravensight.track("after_no"))
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals(before, http.requests.size)
+
+        assertEquals("", Ravensight.resetDeviceId())
+        assertNull(prefs().getString(Ravensight.KEY_DEVICE_ID, null))
+        assertNull(Ravensight.deviceId)
+    }
+
+    @Test
+    fun `setTrackingEnabled before initialize saves the choice for both modes`() {
+        Ravensight.setTrackingEnabled(app, true)
+        assertTrue(prefs().getBoolean(Ravensight.KEY_OPT_IN, false))
+        assertFalse(prefs().getBoolean(Ravensight.KEY_OPT_OUT, true))
+        Ravensight.setTrackingEnabled(app, false)
+        assertFalse(prefs().contains(Ravensight.KEY_OPT_IN))
+        assertTrue(prefs().getBoolean(Ravensight.KEY_OPT_OUT, false))
+    }
+
+    @Test
+    fun `distribution is sent on the session body, an invalid one is not`() {
+        init(config(distribution = "  play-store "))
+        foreground()
+        Ravensight.track("e")
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals("play-store", sessionBody()!!.getString("distribution"))
+
+        Ravensight.resetForTest()
+        http.requests.clear()
+        init(config(distribution = "x".repeat(41)))
+        foreground()
+        Ravensight.track("e")
+        Ravensight.flush()
+        worker.runDue()
+        assertFalse(sessionBody()!!.has("distribution"))
+        assertTrue(ShadowLog.getLogsForTag("Ravensight").any { it.msg.startsWith("distribution ignored") })
+    }
+
+    @Test
+    fun `a session 403 refused key ends the run and clears the queue`() {
+        http.sessionStatus = 403
+        http.sessionError = "invalid_api_key"
+        init()
+        foreground()
+        Ravensight.track("a")
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals("invalid_key", Ravensight.statusReason)
+        assertEquals(0, controller.queueSizeForTest())
+        assertFalse(Ravensight.isEnabled)
+        val before = http.requests.size
+        Ravensight.flush()
+        advance(60 * 60_000L)
+        assertEquals(before, http.requests.size)
+    }
+
+    @Test
+    fun `a batch 401 still refreshes the session`() {
+        init()
+        foreground()
+        Ravensight.track("e")
+        Ravensight.flush()
+        worker.runDue()
+        http.requests.clear()
+        http.batchStatus = 401
+        Ravensight.track("again")
+        Ravensight.flush()
+        worker.runDue()
+        http.batchStatus = 202
+        worker.runDue()
+        assertTrue(http.paths().contains("/session"))
+        assertNull(Ravensight.statusReason)
+    }
+
+    @Test
+    fun `retry waits carry jitter through the Android layer`() {
+        random = 0.0
+        http.sessionStatus = 500
+        init()
+        foreground()
+        Ravensight.track("e")
+        worker.runDue()
+        val sessions = http.paths().count { it == "/session" }
+        advance(7_999L)
+        assertEquals(sessions, http.paths().count { it == "/session" })
+        advance(1L)
+        assertEquals(sessions + 1, http.paths().count { it == "/session" })
+    }
+
+    @Test
+    fun `every event carries a well formed rs_event_id that a resend keeps`() {
+        init()
+        foreground()
+        http.batchStatus = 500
+        Ravensight.track("a", mapOf("x" to 1))
+        Ravensight.track("b", mapOf("rs_event_id" to "mine"))
+        Ravensight.flush()
+        worker.runDue()
+        fun lastBatchIds(): List<String> {
+            val events = JSONObject(http.requests.last { it.path == "/track/batch" }.body!!).getJSONArray("events")
+            return (0 until events.length()).map { events.getJSONObject(it).getJSONObject("data").getString("rs_event_id") }
+        }
+        val first = lastBatchIds() // a and b, answered 500
+        http.batchStatus = 202
+        advance(60_000L)
+        val second = lastBatchIds() // the resend, answered 202
+        assertEquals(listOf("game_started", "a", "b"), batchEvents().take(3).map { it.getString("event") })
+        assertEquals(2, first.size)
+        assertEquals(first, second)
+        val ids = batchEvents().map { it.getJSONObject("data").getString("rs_event_id") }.toSet()
+        assertEquals(3, ids.size) // game_started, a, b
+        assertFalse(ids.contains("mine"))
+        val prefix = Ravensight.deviceId!!.take(16)
+        for (id in ids) {
+            assertTrue(id, Regex("^[A-Za-z0-9_-]{1,64}$").matches(id))
+            assertTrue(id, id.startsWith("$prefix-"))
+        }
+        assertEquals(1, ids.map { it.split("-")[2] }.toSet().size) // one launch nonce
+        assertTrue(Regex("^[0-9a-f]{8}$").matches(first[0].split("-")[2]))
+    }
+
+    @Test
+    fun `an event tracked before the first Activity still carries a valid id`() {
+        init()
+        assertNull(Ravensight.deviceId)
+        Ravensight.track("early")
+        foreground()
+        Ravensight.flush()
+        worker.runDue()
+        val early = batchEvents().first { it.getString("event") == "early" }
+        val id = early.getJSONObject("data").getString("rs_event_id")
+        assertTrue(Regex("^[0-9a-f]{16}-[0-9a-f]+-[0-9a-f]{8}-[0-9]+$").matches(id))
+    }
+
+    @Test
+    fun `the old session's game_exited carries an id`() {
+        init()
+        foreground()
+        background()
+        advance(31 * 60_000L)
+        foreground()
+        val exit = batchEvents().first { it.getString("event") == "game_exited" }
+        assertTrue(Regex("^[A-Za-z0-9_-]{1,64}$").matches(exit.getJSONObject("data").getString("rs_event_id")))
+    }
+
+    @Test
+    fun `an event over 8 KB is dropped with the failure callback and never sent`() {
+        init()
+        foreground()
+        assertFalse(Ravensight.track("huge", mapOf("blob" to "x".repeat(8_200))))
+        assertFalse(Ravensight.track("huge2", mapOf("blob" to "y".repeat(9_000))))
+        assertTrue(Ravensight.track("small", mapOf("path" to "a/b")))
+        Ravensight.flush()
+        worker.runDue()
+        assertEquals(listOf("event_too_large", "event_too_large"), listener.flushFailed)
+        assertEquals(1, ShadowLog.getLogsForTag("Ravensight").count { it.msg.contains("8192 bytes") })
+        assertEquals(listOf("game_started", "small"), eventNames())
+        assertEquals(2L, controller.droppedForTest())
+    }
+
+    @Test
+    fun `the cap is measured on the data with its id`() {
+        init()
+        foreground()
+        // The next id is the device id's first 16 characters, the start
+        // time in hex, the 8 character nonce and the counter (2: game_started
+        // took 1). Find the largest blob that fits exactly, then one more.
+        val idLength = 16 + 1 + (now / 1000L).toString(16).length + 1 + 8 + 1 + 1
+        val probeId = "x".repeat(idLength)
+        val overhead = JSONObject(mapOf("blob" to "", "rs_event_id" to probeId)).toString().length
+        val fits = 8_192 - overhead
+        assertTrue(Ravensight.track("fits", mapOf("blob" to "z".repeat(fits))))
+        assertFalse(Ravensight.track("over", mapOf("blob" to "z".repeat(fits + 1))))
+        assertEquals(listOf("event_too_large"), listener.flushFailed)
     }
 }
 
@@ -1025,6 +1316,11 @@ internal class FakeTransport : RavensightTransport {
 
 internal class RecordingListener : RavensightListener {
     val statuses = mutableListOf<String?>()
+    val flushFailed = mutableListOf<String>()
+
+    override fun onFlushFailed(reason: String) {
+        flushFailed += reason
+    }
     val trackingDisabled = mutableListOf<String>()
     val feedbackFailed = mutableListOf<String>()
     var feedbackSubmitted = 0

@@ -13,11 +13,11 @@ import org.junit.Test
 class RavensightCoreTest {
 
     private var now = 1_000_000_000_000L
-    private fun core(config: RavensightCoreConfig = RavensightCoreConfig()) =
+    private fun core(config: RavensightCoreConfig = RavensightCoreConfig(random = { 0.5 })) =
         RavensightCore(config) { now }
 
     /** Walks a fresh core through settings ok + session ok. */
-    private fun booted(config: RavensightCoreConfig = RavensightCoreConfig()): RavensightCore {
+    private fun booted(config: RavensightCoreConfig = RavensightCoreConfig(random = { 0.5 })): RavensightCore {
         val c = core(config)
         assertTrue(c.nextAction() is RavensightAction.CheckSettings)
         c.onSettingsResult(200, true)
@@ -191,7 +191,7 @@ class RavensightCoreTest {
 
     @Test
     fun `custom queue cap is respected`() {
-        val c = core(RavensightCoreConfig(maxQueueSize = 3))
+        val c = core(RavensightCoreConfig(random = { 0.5 }, maxQueueSize = 3))
         c.onSettingsResult(200, true)
         repeat(5) { c.track("e$it") }
         assertEquals(3, c.queueSize)
@@ -484,29 +484,42 @@ class RavensightCoreTest {
     // --- Refusals and the reason vocabulary --------------------------------
 
     @Test
-    fun `settings 401 makes one request then none and keeps the queue`() {
+    fun `settings 401 ends the run and clears the queue`() {
         val c = core()
         c.track("early")
         assertTrue(c.nextAction() is RavensightAction.CheckSettings)
         c.onSettingsResult(401, null, "invalid_api_key")
         assertTrue(c.keyRefused)
         assertEquals(RavensightReason.INVALID_KEY, c.reason)
+        assertEquals(RavensightReason.INVALID_KEY, c.stopReason)
         repeat(3) { now += 600_000L; assertTrue(c.nextAction() is RavensightAction.Idle) }
-        // Events keep queueing while the key is refused.
-        assertTrue(c.track("later"))
-        assertEquals(2, c.queueSize)
+        assertEquals(0, c.queueSize)
+        assertFalse(c.track("later"))
+        assertEquals(1L, c.stats.dropped)
     }
 
     @Test
-    fun `an explicit retry after a refused key makes exactly one more attempt`() {
+    fun `an explicit retry after a key refused at boot makes no attempt`() {
         val c = core()
         c.track("e")
         c.nextAction()
-        c.onSettingsResult(401, null)
+        c.onSettingsResult(403, null, "forbidden")
         c.retryOnce()
-        assertTrue(c.nextAction() is RavensightAction.CheckSettings)
-        c.onSettingsResult(401, null)
         assertTrue(c.nextAction() is RavensightAction.Idle)
+    }
+
+    @Test
+    fun `a batch 403 still allows one explicit retry`() {
+        val c = booted()
+        c.track("e")
+        c.nextAction()
+        val outcome = c.onBatchResult(403, errorCode = "forbidden")
+        assertEquals(RavensightReason.INVALID_KEY, (outcome as BatchOutcome.Refused).reason)
+        assertNull(c.stopReason)
+        assertEquals(1, c.queueSize)
+        assertTrue(c.nextAction() is RavensightAction.Idle)
+        c.retryOnce()
+        assertTrue(c.nextAction() is RavensightAction.SendBatch)
     }
 
     @Test
@@ -520,7 +533,9 @@ class RavensightCoreTest {
         assertEquals(RavensightReason.INVALID_KEY, (outcome as SessionOutcome.Refused).reason)
         now += 3_600_000L
         assertTrue(c.nextAction() is RavensightAction.Idle)
-        assertEquals(1, c.queueSize)
+        assertEquals(0, c.queueSize)
+        c.retryOnce()
+        assertTrue(c.nextAction() is RavensightAction.Idle)
     }
 
     @Test
@@ -649,7 +664,7 @@ class RavensightCoreTest {
 
     @Test
     fun `a queue cap below one is clamped to one`() {
-        val c = core(RavensightCoreConfig(maxQueueSize = 0, maxBatchSize = 0))
+        val c = core(RavensightCoreConfig(random = { 0.5 }, maxQueueSize = 0, maxBatchSize = 0))
         assertTrue(c.track("a"))
         assertTrue(c.track("b"))
         assertEquals(1, c.queueSize)
@@ -694,5 +709,95 @@ class RavensightCoreTest {
         assertEquals(2L, stats.flushes)
         assertEquals(1L, stats.sessions)
         assertEquals(0L, stats.dropped)
+    }
+
+    // --- 0.3.0 public build rules ------------------------------------------
+
+    private fun firstBackoffWait(roll: Double): Long {
+        val c = core(RavensightCoreConfig(random = { roll }))
+        c.onSettingsResult(200, true)
+        c.track("e")
+        assertTrue(c.nextAction() is RavensightAction.OpenSession)
+        c.onSessionResult(500, null)
+        return c.retryInMs
+    }
+
+    @Test
+    fun `backoff jitter stays within twenty percent`() {
+        assertEquals(8_000L, firstBackoffWait(0.0))
+        assertEquals(10_000L, firstBackoffWait(0.5)) // a fixed 0.5 is the old backoff exactly
+        assertEquals(12_000L, firstBackoffWait(0.999_999))
+        repeat(200) {
+            val wait = firstBackoffWait(kotlin.random.Random.nextDouble())
+            assertTrue("wait $wait", wait in 8_000L..12_000L)
+        }
+    }
+
+    @Test
+    fun `jitter never passes the ceiling`() {
+        val c = core(RavensightCoreConfig(random = { 0.999_999 }))
+        c.onSettingsResult(200, true)
+        c.track("e")
+        repeat(12) {
+            now += 400_000L
+            assertTrue(c.nextAction() is RavensightAction.OpenSession)
+            c.onSessionResult(500, null)
+            assertTrue(c.retryInMs <= RavensightCoreConfig.MAX_BACKOFF_MS)
+        }
+    }
+
+    @Test
+    fun `Retry-After is honoured exactly whatever the jitter`() {
+        val c = core(RavensightCoreConfig(random = { 0.0 }))
+        c.onSettingsResult(200, true)
+        c.track("e")
+        c.nextAction()
+        c.onSessionResult(429, null, retryAfterSec = 60L)
+        assertEquals(60_000L, c.retryInMs)
+    }
+
+    @Test
+    fun `event ids have the server shape and count up`() {
+        val ids = RavensightEventIds(nonce = "a1b2c3d4", startSec = 1_700_000_000L)
+        val first = ids.next("dev_0123456789abcdef0123")
+        assertEquals("dev_0123456789ab-${1_700_000_000L.toString(16)}-a1b2c3d4-1", first)
+        val more = (0 until 50).map { ids.next("dev_0123456789abcdef0123") }
+        assertEquals(51, (more + first).toSet().size)
+        for (id in more + first) assertTrue(id, RavensightEventIds.isValid(id))
+        assertEquals("pt-run42x", RavensightEventIds.prefixFor("pt-run.42/x"))
+        assertTrue(RavensightEventIds.isValid(ids.next("pt-run.42/x é")))
+        assertTrue(RavensightEventIds.isValid(ids.next("")))
+        assertFalse(RavensightEventIds.isValid("has space"))
+        assertFalse(RavensightEventIds.isValid("x".repeat(65)))
+    }
+
+    @Test
+    fun `a resend carries the same event data`() {
+        val c = booted()
+        c.track("e", mapOf(RavensightLimits.EVENT_ID_KEY to "id-1"))
+        val first = c.nextAction() as RavensightAction.SendBatch
+        c.onBatchResult(500)
+        c.retryOnce()
+        now += 60_000L
+        val second = c.nextAction() as RavensightAction.SendBatch
+        assertEquals(first.events.map { it.data }, second.events.map { it.data })
+    }
+
+    @Test
+    fun `distribution labels are validated like the server`() {
+        assertEquals("a".repeat(40), RavensightLimits.validDistribution("a".repeat(40)))
+        assertEquals("testflight", RavensightLimits.validDistribution("  testflight "))
+        assertNull(RavensightLimits.validDistribution("a".repeat(41)))
+        assertNull(RavensightLimits.validDistribution("bad\nlabel"))
+        assertNull(RavensightLimits.validDistribution("bad\u007f"))
+        assertNull(RavensightLimits.validDistribution("  "))
+        assertNull(RavensightLimits.validDistribution(null))
+    }
+
+    @Test
+    fun `dropped events before the queue are counted`() {
+        val c = core()
+        c.countDropped(2)
+        assertEquals(2L, c.stats.dropped)
     }
 }
