@@ -44,7 +44,7 @@ Then add the dependency (`app/build.gradle.kts`):
 
 ```kotlin
 dependencies {
-    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.3.0")
+    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.3.1")
 }
 ```
 
