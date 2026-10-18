@@ -2,6 +2,8 @@
 
 ## 0.3.1 (held)
 
+- Add opt-in screenshot Player Reports with bounded Bitmap encoding, credential-free storage upload, stable retry identity and session/consent guards.
+
 - Add session-start remote config, scoped persistent cache, ETags, typed fallback getters and main-thread readiness callbacks.
 - Add active experiment labels to newly tracked events.
 - Discard late config responses after identity or consent changes.

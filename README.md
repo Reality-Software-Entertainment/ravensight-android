@@ -600,3 +600,45 @@ Active experiments automatically add `rs_exp_<key>` to newly tracked events,
 including typed helpers. Already queued events retain their original properties.
 Refresh config to pick up stopped experiments. No config access occurs while the
 SDK is inactive or before the player's consent.
+
+## Player Reports (held local candidate)
+
+The local candidate adds `Ravensight.submitReport`. It requires an already-open
+SDK session; `no_session` is returned without opening another session or sending
+a report. This API is not yet in the published version shown above.
+
+```kotlin
+// Capture only the game area after the player chooses to attach an image.
+val report = RavensightReport.fromBitmap(
+    message = "The platform disappears here",
+    screenshot = playerApprovedBitmap,
+    category = "bug",
+    metadata = mapOf("level" to 3),
+)
+Ravensight.submitReport(report) { result ->
+    if (result.receipt != null) showReportSent()
+    else showReportError(result.error) // Preserve `report` for an explicit retry.
+}
+```
+
+You can supply encoded JPEG, PNG or WebP bytes with
+`RavensightReport(message = "...", screenshotData = bytes)`, or omit the image
+for an intentional text-only report. Images are limited to 1 MB and 4 million
+pixels. The Bitmap helper encodes a bounded JPEG once; failed capture or upload
+never silently submits text instead. Hide private UI before capture.
+
+Callbacks run on the main thread. The report retains its ID, captured time,
+image and scalar metadata for retry. Reuse the same object within its original
+session; another session returns `report_session_changed` to avoid duplicate
+usage. Do not recreate it automatically on errors. Identity changes, opt-out
+and session expiry stop subsequent upload/finalization steps. A report still
+processing returns `report_processing` after bounded polling; explicit retry
+uses the same report. Capture timestamps expire after 24 hours.
+
+Text reports use 1 event; screenshot reports use 20,001 events under the existing
+Player Reports contract. Presigned storage uploads receive no SDK credentials.
+The API does not capture the screen or invoke AI automatically.
+
+Validation uses Robolectric native bitmap encoding/decoding plus stub API and
+storage transports. Real device capture and a live storage upload remain release
+checks; they are not claimed as tested here.

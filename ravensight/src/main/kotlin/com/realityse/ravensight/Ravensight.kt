@@ -307,6 +307,14 @@ object Ravensight {
             }
         }
 
+    /** Submit a stable player-approved report. Retries never open or migrate sessions. */
+    @JvmStatic
+    fun submitReport(report: RavensightReport, completion: (RavensightReportResult) -> Unit) {
+        val c = controller
+        if (c == null) Handler(Looper.getMainLooper()).post { completion(RavensightReportResult(error = "not_initialized")) }
+        else c.submitReport(report, completion)
+    }
+
     /**
      * EXPERIMENTAL: fetches AI generated design suggestions for your game.
      * Empty until the game has accumulated enough data for weekly digests,
@@ -722,6 +730,27 @@ object Ravensight {
 
         fun submitFeedback(message: String, category: String?, rating: Int) {
             post("submitFeedback") { sendFeedback(message, category, rating) }
+        }
+
+        fun submitReport(report: RavensightReport, completion: (RavensightReportResult) -> Unit) {
+            val generation = configGeneration.get()
+            val done: (RavensightReportResult) -> Unit = { result -> mainPost(Runnable { completion(result) }) }
+            if (inert || !active) { done(RavensightReportResult(error = "disabled")); return }
+            post("submitReport") {
+                try {
+                    val refusal = report.refusal(clock() / 1000)
+                    if (refusal != null) { done(RavensightReportResult(error = refusal)); return@post }
+                    val token = core.sessionToken?.takeIf { core.isSessionValid() }
+                    if (token == null) { done(RavensightReportResult(error = "no_session")); return@post }
+                    val binding = "$apiUrl|${config.ingestKey}|$token"
+                    val refusalBinding = report.begin(binding)
+                    if (refusalBinding != null) { done(RavensightReportResult(error = refusalBinding)); return@post }
+                    ReportSubmission(report, apiUrl, headers("X-Session-Token" to token), transport,
+                        deps.reportUpload ?: ReportHttpUpload(config.requestTimeoutMs),
+                        allowed = { active && core.isActive && generation == configGeneration.get() && core.sessionToken == token && core.isSessionValid() },
+                        delay = { worker.postDelayed(it, 500) }, completion = done).start()
+                } catch (_: Exception) { report.finish(); done(RavensightReportResult(error = "invalid_report")) }
+            }
         }
 
         fun fetchSuggestions() {
@@ -1456,6 +1485,7 @@ internal class HandlerWorker : RavensightWorker {
 
 /** Seams for the unit tests. Production uses the defaults. */
 internal class RavensightDeps(
+    val reportUpload: ReportUpload? = null,
     val transport: RavensightTransport? = null,
     val clockMs: () -> Long = { System.currentTimeMillis() },
     val worker: RavensightWorker? = null,

@@ -21,3 +21,5 @@ Config identifier compatibility audit: 5 focused Robolectric config tests passed
 Config property keys reject constructor/prototype, including nested JSON properties.
 Experiment keys and variant labels may use those words as string values, matching
 the server contract. Regression coverage distinguishes those cases. Publishing remains held.
+
+Player Reports: full `:core:test :ravensight:testDebugUnitTest :ravensight:assembleRelease` passes offline on JDK 17. Report tests use native Robolectric graphics and fake API/storage transports; 10 cases cover immutable capture, retry identity, expired sessions, identity/consent changes, malformed images/metadata, bounded polling and Bitmap encoding. Physical device and live storage upload remain unverified. Publishing remains held.
