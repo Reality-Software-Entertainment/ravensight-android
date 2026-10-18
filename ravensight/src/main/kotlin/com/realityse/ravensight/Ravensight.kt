@@ -48,7 +48,7 @@ import org.json.JSONObject
 object Ravensight {
 
     /** This SDK's version. */
-    const val VERSION: String = "0.3.0"
+    const val VERSION: String = "0.3.1"
 
     internal const val TAG = "Ravensight"
     internal const val PREFS = "ravensight"
@@ -270,6 +270,15 @@ object Ravensight {
         extra: Map<String, Any?>? = null,
         eventName: String = "error",
     ): Boolean = track(eventName, TypedEvents.error(severity, message, stack, extra))
+
+    /** Refresh public config, with readiness delivered to the listener. */
+    @JvmStatic
+    fun fetchConfig() = safely("fetchConfig") { controller?.fetchConfig() }
+
+    @JvmStatic
+    fun <T> getConfig(key: String, fallback: T): T = safely("getConfig", fallback) {
+        controller?.getConfig(key, fallback) ?: fallback
+    }
 
     /**
      * Asks for an immediate flush of anything queued. After a key refused on
@@ -497,6 +506,11 @@ object Ravensight {
             RavensightCoreConfig(maxQueueSize = config.maxQueueSize, random = deps.random),
         ) { clock() }
 
+        @Volatile private var remoteConfig: RemoteConfig? = null
+        @Volatile private var remoteScope: String? = null
+        private val configPending = AtomicBoolean(false)
+        private val configGeneration = java.util.concurrent.atomic.AtomicLong(0)
+
         private val distribution = RavensightLimits.validDistribution(config.distribution)
 
         /** rs_event_id: a launch nonce from SecureRandom, the start time and a counter. */
@@ -654,6 +668,7 @@ object Ravensight {
         }
 
         fun setEnabledByGame(enabled: Boolean) {
+            configGeneration.incrementAndGet()
             enabledByGame = enabled
             applyFrameSampling()
             active = serverAllows && effectiveEnabled()
@@ -661,6 +676,7 @@ object Ravensight {
         }
 
         fun setOptedOut(value: Boolean) {
+            configGeneration.incrementAndGet()
             optedOut = value
             applyFrameSampling()
             active = serverAllows && effectiveEnabled()
@@ -673,6 +689,7 @@ object Ravensight {
         }
 
         fun resetDeviceId(): String {
+            configGeneration.incrementAndGet()
             if (isPlaytest) {
                 Log.i(TAG, "resetDeviceId ignored during a playtest run")
                 return deviceId ?: ""
@@ -955,6 +972,7 @@ object Ravensight {
         private fun stamp(data: Map<String, Any?>): Map<String, Any?> {
             val prefix = deviceId?.let { RavensightEventIds.prefixFor(it) } ?: launchPrefix
             val copy = LinkedHashMap(data)
+            cachedConfig()?.experiments?.forEach { (key, value) -> copy["rs_exp_$key"] = value }
             copy[RavensightLimits.EVENT_ID_KEY] = eventIds.next(prefix)
             return copy
         }
@@ -1074,6 +1092,48 @@ object Ravensight {
             }
         }
 
+        private fun currentConfigScope(): String {
+            val text = JSONArray(listOf(apiUrl, config.ingestKey, deviceId, "android", gameVersion, isPlaytest)).toString()
+            return java.security.MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+        }
+
+        @Synchronized private fun cachedConfig(): RemoteConfig? {
+            if (!active || !effectiveEnabled() || deviceId == null) return null
+            val scope = currentConfigScope()
+            if (remoteScope != scope) {
+                remoteScope = scope
+                remoteConfig = if (!isPlaytest && prefs.getString("config_scope", null) == scope) prefs.getString("config_document", null)?.let(RemoteConfig::parse) else null
+            }
+            return remoteConfig
+        }
+
+        fun <T> getConfig(key: String, fallback: T): T = cachedConfig()?.get(key, fallback) ?: fallback
+
+        fun fetchConfig() {
+            if (!active || !effectiveEnabled() || deviceId == null || !configPending.compareAndSet(false, true)) return
+            val generation = configGeneration.get()
+            post("fetchConfig") {
+                try {
+                    if (!active || !effectiveEnabled() || generation != configGeneration.get()) return@post
+                    val scope = currentConfigScope()
+                    val cached = cachedConfig()
+                    val requestHeaders = headers("X-API-Key" to config.ingestKey).toMutableMap()
+                    cached?.etag?.let { requestHeaders["If-None-Match"] = it }
+                    fun encode(value: String) = java.net.URLEncoder.encode(value, "UTF-8")
+                    val result = transport.request("GET", "$apiUrl/ingest/config?deviceId=${encode(deviceId!!)}&platform=android&gameVersion=${encode(gameVersion)}", requestHeaders, null)
+                    if (!active || !effectiveEnabled() || generation != configGeneration.get() || scope != currentConfigScope()) return@post
+                    val fresh = if (result.status == 200) RemoteConfig.parse(result.body) else null
+                    if (fresh != null) {
+                        synchronized(this) {
+                            remoteConfig = fresh; remoteScope = scope
+                            if (!isPlaytest) prefs.edit().putString("config_scope", scope).putString("config_document", fresh.raw).apply()
+                        }
+                    }
+                    emit { it.onConfigReady(if (fresh != null) "network" else if (cached != null) "cache" else "default") }
+                } finally { configPending.set(false) }
+            }
+        }
+
         private fun openSession() {
             if (deviceId == null) resolveDeviceId()
             val id = deviceId ?: run {
@@ -1103,6 +1163,7 @@ object Ravensight {
                     if (!inForeground) backgroundedAtMs?.let { writeMarker(it) }
                     if (foregrounded && core.isActive) scheduleTick()
                     emit { it.onSessionReady() }
+                    fetchConfig()
                 }
                 is SessionOutcome.RateLimited -> {
                     verbose("session creation rate limited (${outcome.reason})")

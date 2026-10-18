@@ -127,6 +127,66 @@ class RavensightTest {
 
     private fun eventNames() = batchEvents().map { it.getString("event") }
 
+    private fun configDocument(): String = JSONObject()
+        .put("values", JSONObject().put("speed", 3).put("hints", false).put("rules", JSONObject().put("bonus", 2)))
+        .put("experiments", JSONArray().put(JSONObject().put("key", "difficulty").put("variant", "easy")))
+        .put("etag", "\"" + "a".repeat(64) + "\"").toString()
+
+    @Test
+    fun `config uses scoped cache ETags and strict getters with exposure labels`() {
+        http.override = { req -> if (req.path.startsWith("/ingest/config?")) HttpResult(if (req.headers.containsKey("If-None-Match")) 304 else 200, configDocument(), null) else null }
+        init(); foreground()
+        assertEquals(3, Ravensight.getConfig("speed", 0))
+        assertFalse(Ravensight.getConfig("hints", true))
+        assertEquals("fallback", Ravensight.getConfig("speed", "fallback"))
+        assertTrue(Ravensight.getConfig("speed", true))
+        assertEquals(9, Ravensight.getConfig("hints", 9))
+        Ravensight.fetchConfig(); Ravensight.fetchConfig(); worker.runDue()
+        val requests = http.requests.filter { it.path.startsWith("/ingest/config?") }
+        assertEquals(2, requests.size)
+        assertEquals("\"" + "a".repeat(64) + "\"", requests.last().headers["If-None-Match"])
+        assertEquals(config().ingestKey, requests.first().headers["X-API-Key"])
+        assertTrue(requests.first().path.contains("&platform=android&gameVersion=1.0.0"))
+        Ravensight.track("level", mapOf("rs_exp_difficulty" to "forged")); Ravensight.flush(); worker.runDue()
+        assertEquals("easy", batchEvents().last { it.getString("event") == "level" }.getJSONObject("data").getString("rs_exp_difficulty"))
+        http.override = { req -> if (req.path.startsWith("/ingest/config?")) HttpResult(0, "", null) else null }
+        Ravensight.fetchConfig(); worker.runDue(); assertEquals(3, Ravensight.getConfig("speed", 0))
+        Ravensight.resetDeviceId(); assertEquals(0, Ravensight.getConfig("speed", 0)); worker.runDue()
+    }
+
+    @Test
+    fun `config discards response when consent changes during fetch`() {
+        init(); foreground()
+        http.override = { req ->
+            if (req.path.startsWith("/ingest/config?")) {
+                Ravensight.setTrackingEnabled(app, false)
+                Ravensight.setTrackingEnabled(app, true)
+                HttpResult(200, configDocument(), null)
+            } else null
+        }
+        Ravensight.fetchConfig(); worker.runDue()
+        assertEquals(0, Ravensight.getConfig("speed", 0))
+        assertNull(prefs().getString("config_document", null))
+    }
+
+    @Test
+    fun `config rejects malformed documents and clears stopped assignments`() {
+        init(); foreground()
+        assertNull(RemoteConfig.parse(configDocument().replace("easy", "bad value")))
+        assertNull(RemoteConfig.parse(configDocument().replace("bonus", "__proto__")))
+        assertNull(RemoteConfig.parse("{"))
+        http.override = { req -> if (req.path.startsWith("/ingest/config?")) HttpResult(200, configDocument(), null) else null }
+        Ravensight.fetchConfig(); worker.runDue()
+        val copy = Ravensight.getConfig("rules", emptyMap<String, Any?>()).toMutableMap()
+        copy["bonus"] = 99
+        assertEquals(2, Ravensight.getConfig("rules", emptyMap<String, Any?>())["bonus"])
+        val empty = JSONObject(configDocument()).put("values", JSONObject()).put("experiments", JSONArray()).toString()
+        http.override = { req -> if (req.path.startsWith("/ingest/config?")) HttpResult(200, empty, null) else null }
+        Ravensight.fetchConfig(); worker.runDue(); assertEquals(0, Ravensight.getConfig("speed", 0))
+        Ravensight.track("after"); Ravensight.flush(); worker.runDue()
+        assertFalse(batchEvents().last { it.getString("event") == "after" }.getJSONObject("data").has("rs_exp_difficulty"))
+    }
+
     // --- X1: never throw into the game ------------------------------------
 
     @Test
@@ -204,7 +264,7 @@ class RavensightTest {
         assertEquals(0, http.requests.size)
         Ravensight.setEnabled(true)
         worker.runDue()
-        assertEquals(listOf("/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
         assertEquals(listOf("game_started"), eventNames())
     }
 
@@ -283,7 +343,7 @@ class RavensightTest {
         Ravensight.track("after")
         Ravensight.flush()
         worker.runDue()
-        assertEquals(listOf("/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/session", "/ingest/config", "/track/batch"), http.paths())
         assertEquals(fresh, JSONObject(http.requests[0].body!!).getString("deviceId"))
         assertEquals(listOf("after"), eventNames())
     }
@@ -307,7 +367,7 @@ class RavensightTest {
         advance(60_000)
         assertEquals(0, http.requests.size)
         foreground()
-        assertEquals(listOf("/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
         // game_started opens the session, ahead of anything tracked before the foreground.
         assertEquals(listOf("game_started", "from_a_push_handler"), eventNames())
     }
@@ -324,7 +384,7 @@ class RavensightTest {
         val started = batchEvents().filter { it.getString("event") == "game_started" }
         assertEquals(1, started.size)
         assertEquals(startedAt / 1000, started[0].getLong("timestamp"))
-        assertEquals(listOf("/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
     }
 
     @Test
@@ -360,13 +420,13 @@ class RavensightTest {
         background()
         advance(31 * 60_000L)
         foreground()
-        assertEquals(listOf("/track/batch", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/track/batch", "/session", "/ingest/config", "/track/batch"), http.paths())
         val exited = JSONObject(http.requests[0].body!!).getJSONArray("events").getJSONObject(0)
         assertEquals("game_exited", exited.getString("event"))
         assertEquals(backgroundedAt / 1000, exited.getLong("timestamp"))
         assertEquals("tok_1", http.requests[0].headers["X-Session-Token"])
-        assertEquals("tok_2", http.requests[2].headers["X-Session-Token"])
-        val started = JSONObject(http.requests[2].body!!).getJSONArray("events").getJSONObject(0)
+        assertEquals("tok_2", http.requests[3].headers["X-Session-Token"])
+        val started = JSONObject(http.requests[3].body!!).getJSONArray("events").getJSONObject(0)
         assertEquals("game_started", started.getString("event"))
         assertEquals(now / 1000, started.getLong("timestamp"))
         assertFalse(prefs().contains(Ravensight.KEY_MARKER_TOKEN))
@@ -460,7 +520,7 @@ class RavensightTest {
         advance(29_999)
         assertEquals(1, http.requests.size)
         advance(1)
-        assertEquals(listOf("/settings", "/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/settings", "/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
         assertEquals(null, Ravensight.statusReason)
     }
 
@@ -542,7 +602,7 @@ class RavensightTest {
         assertEquals((now - 120_000L) / 1000, events.getJSONObject(0).getLong("timestamp"))
         val exitData = events.getJSONObject(0).getJSONObject("data")
         assertEquals(listOf("rs_event_id"), exitData.keys().asSequence().toList()) // nothing but its id
-        assertEquals(listOf("/track/batch", "/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/track/batch", "/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
         assertFalse(prefs().contains(Ravensight.KEY_MARKER_TOKEN))
     }
 
@@ -591,7 +651,7 @@ class RavensightTest {
         init(config(trackPauseEvents = true), activityCallbacks = true)
         val activity = Robolectric.buildActivity(Activity::class.java).setup()
         worker.runDue()
-        assertEquals(listOf("/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
         http.requests.clear()
         val rotated = Configuration(app.resources.configuration).apply {
             orientation = if (orientation == Configuration.ORIENTATION_PORTRAIT) {
@@ -747,7 +807,7 @@ class RavensightTest {
         http.feedbackStatus = 401
         Ravensight.submitFeedback("hi")
         worker.runDue()
-        assertEquals(listOf("/feedback", "/session"), http.paths())
+        assertEquals(listOf("/feedback", "/session", "/ingest/config"), http.paths())
         assertEquals("tok_2", Ravensight.sessionToken)
     }
 
@@ -846,7 +906,7 @@ class RavensightTest {
         foreground()
         assertTrue(Ravensight.isPlaytest)
         assertEquals("pt-run42", Ravensight.deviceId)
-        assertEquals(listOf("/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
         assertTrue(http.requests.all { it.headers["X-Ravensight-Playtest"] == "ptok" })
         assertEquals("pt-run42", JSONObject(http.requests[1].body!!).getString("deviceId"))
         assertFalse(prefs().contains(Ravensight.KEY_DEVICE_ID))
@@ -948,7 +1008,7 @@ class RavensightTest {
 
     @Test
     fun `the version constant is 0_3_0`() {
-        assertEquals("0.3.0", Ravensight.VERSION)
+        assertEquals("0.3.1", Ravensight.VERSION)
     }
 
     // --- 0.3.0 public build rules ------------------------------------------
@@ -1025,7 +1085,7 @@ class RavensightTest {
         val id = Ravensight.deviceId!!
         assertTrue(id.startsWith("dev_"))
         assertEquals(id, prefs().getString(Ravensight.KEY_DEVICE_ID, null))
-        assertEquals(listOf("/settings", "/session", "/track/batch"), http.paths())
+        assertEquals(listOf("/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
         assertEquals(listOf("game_started", "right_after_yes"), eventNames())
         assertEquals(id, sessionBody()!!.getString("deviceId"))
         assertTrue(Ravensight.isTrackingEnabled(app))
@@ -1269,6 +1329,7 @@ internal class FakeTransport : RavensightTransport {
     }
 
     val requests = mutableListOf<Request>()
+    var override: ((Request) -> HttpResult?)? = null
     var settingsStatus = 200
     var trackingEnabled = true
     var sessionStatus = 201
@@ -1281,11 +1342,12 @@ internal class FakeTransport : RavensightTransport {
     var failTokenOnce: String? = null
     private var sessions = 0
 
-    fun paths() = requests.map { it.path }
+    fun paths() = requests.map { it.path.substringBefore("?") }
 
     override fun request(method: String, url: String, headers: Map<String, String>, body: String?): HttpResult {
         val r = Request(method, url, headers, body)
         requests += r
+        override?.invoke(r)?.let { return it }
         if (throwOn != null && r.path == throwOn) throw IllegalStateException("boom")
         return when (r.path) {
             "/settings" -> if (settingsStatus == 200) {

@@ -280,7 +280,7 @@ class TypedEventsTest {
     fun `the session request carries the sdk name and version`() {
         start()
         val body = JSONObject(http.requests.first { it.path == "/session" }.body!!)
-        assertEquals("android/0.3.0", body.getString("sdk"))
+        assertEquals("android/0.3.1", body.getString("sdk"))
     }
 
     // --- Health ------------------------------------------------------------

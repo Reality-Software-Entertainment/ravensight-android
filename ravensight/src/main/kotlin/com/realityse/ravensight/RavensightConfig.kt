@@ -148,6 +148,8 @@ enum class RavensightConsent {
  * override only what you need. Callbacks are delivered on the main thread.
  */
 interface RavensightListener {
+    /** Config is ready from network, cache, or safe defaults. Main thread. */
+    fun onConfigReady(source: String) {}
     /** A session token has been issued and events are flowing. */
     fun onSessionReady() {}
 

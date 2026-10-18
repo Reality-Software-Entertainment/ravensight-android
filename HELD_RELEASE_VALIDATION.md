@@ -14,3 +14,5 @@ Physical-device and live-service validation is not implied by these checks.
 Publishing, tags, marketplace submission and deployments remain held pending
 owner approval. Older README test counts describe their earlier branch runs;
 this file records the combined candidate.
+
+Remote config wave: core and Android Robolectric test tasks passed. The Android module has 93 passing cases, including config caching/ETags, strict fallback, automatic labels, malformed data and consent changes during a response. Version 0.3.1 remains held; physical-device and live API checks remain distinct release gates.

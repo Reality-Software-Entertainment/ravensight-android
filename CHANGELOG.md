@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 (held)
+
+- Add session-start remote config, scoped persistent cache, ETags, typed fallback getters and main-thread readiness callbacks.
+- Add active experiment labels to newly tracked events.
+- Discard late config responses after identity or consent changes.
+
+
 ## [0.3.0] - 2026-10-16
 
 For games whose builds or source anyone can download. A game that passes

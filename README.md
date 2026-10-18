@@ -570,3 +570,33 @@ three on pushes to `main` and on pull requests.
 ## License
 
 MIT. Copyright 2026 Reality Software Entertainment.
+
+## Remote configuration and experiments
+
+Held release: the platform config endpoint must be deployed first. Config is
+public game data, never secrets. A successful session schedules a config fetch
+on the existing background worker using your existing ingest key.
+
+```kotlin
+val listener = object : RavensightListener {
+    override fun onConfigReady(source: String) {
+        val speed = Ravensight.getConfig("movement_speed", 4.0)
+    }
+}
+Ravensight.initialize(applicationContext, config, listener)
+Ravensight.fetchConfig() // Explicit refresh, concurrent requests deduplicate.
+```
+
+The readiness source is `network`, `cache` or `default`, delivered on the main
+thread. Typed getters use your fallback on missing/mismatched values and return
+copies of maps/lists. Boolean and string values are never coerced into numbers.
+Config requests use the configured HTTP timeout. Invalid or offline responses
+keep the last valid document; unchanged ETags are free and fresh responses use
+one ordinary event. Keep safe defaults for first launch and offline play.
+
+A single persistent cache is scoped to endpoint, key, device, platform and build.
+Playtests never persist it. Consent/identity changes invalidate late responses.
+Active experiments automatically add `rs_exp_<key>` to newly tracked events,
+including typed helpers. Already queued events retain their original properties.
+Refresh config to pick up stopped experiments. No config access occurs while the
+SDK is inactive or before the player's consent.
