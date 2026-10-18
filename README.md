@@ -601,11 +601,13 @@ including typed helpers. Already queued events retain their original properties.
 Refresh config to pick up stopped experiments. No config access occurs while the
 SDK is inactive or before the player's consent.
 
-## Player Reports (held local candidate)
+## Player Reports (0.3.1)
 
-The local candidate adds `Ravensight.submitReport`. It requires an already-open
+Version 0.3.1 adds `Ravensight.submitReport`. It requires an already-open
 SDK session; `no_session` is returned without opening another session or sending
-a report. This API is not yet in the published version shown above.
+a report. The source is available at tag `v0.3.1`; JitPack builds the dependency
+on demand. If that version is still building, wait for the artifact before adding
+it to your game.
 
 ```kotlin
 // Capture only the game area after the player chooses to attach an image.
