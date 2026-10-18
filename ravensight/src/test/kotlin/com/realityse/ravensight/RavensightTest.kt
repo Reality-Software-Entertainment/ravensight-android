@@ -14,6 +14,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -167,6 +168,20 @@ class RavensightTest {
         Ravensight.fetchConfig(); worker.runDue()
         assertEquals(0, Ravensight.getConfig("speed", 0))
         assertNull(prefs().getString("config_document", null))
+    }
+
+    @Test
+    fun `config reserved property names do not forbid experiment string labels`() {
+        for (word in listOf("constructor", "prototype")) {
+            val doc = JSONObject(configDocument())
+            doc.put("values", JSONObject().put(word, 1))
+            assertNull(RemoteConfig.parse(doc.toString()))
+            doc.put("values", JSONObject().put("nested", JSONObject().put(word, 1)))
+            assertNull(RemoteConfig.parse(doc.toString()))
+            doc.put("values", JSONObject())
+            doc.put("experiments", JSONArray().put(JSONObject().put("key", word).put("variant", word)))
+            assertNotNull(RemoteConfig.parse(doc.toString()))
+        }
     }
 
     @Test

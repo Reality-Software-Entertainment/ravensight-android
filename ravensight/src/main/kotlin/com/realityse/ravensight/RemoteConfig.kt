@@ -27,7 +27,7 @@ internal data class RemoteConfig(val values: Map<String, Any?>, val experiments:
                 val etag = doc.getString("etag")
                 require(values.length() <= 50 && rows.length() <= 10 && Regex("^\"[a-f0-9]{64}\"$").matches(etag))
                 for (k in values.keys()) {
-                    require(key.matches(k) && safe(values.get(k)))
+                    require(key.matches(k) && k !in setOf("constructor", "prototype") && safe(values.get(k)))
                     require(JSONArray().put(values.get(k)).toString().toByteArray(Charsets.UTF_8).size <= 8194)
                 }
                 val experiments = linkedMapOf<String, String>()

@@ -16,3 +16,8 @@ owner approval. Older README test counts describe their earlier branch runs;
 this file records the combined candidate.
 
 Remote config wave: core and Android Robolectric test tasks passed. The Android module has 93 passing cases, including config caching/ETags, strict fallback, automatic labels, malformed data and consent changes during a response. Version 0.3.1 remains held; physical-device and live API checks remain distinct release gates.
+
+Config identifier compatibility audit: 5 focused Robolectric config tests passed with Gradle offline mode.
+Config property keys reject constructor/prototype, including nested JSON properties.
+Experiment keys and variant labels may use those words as string values, matching
+the server contract. Regression coverage distinguishes those cases. Publishing remains held.
