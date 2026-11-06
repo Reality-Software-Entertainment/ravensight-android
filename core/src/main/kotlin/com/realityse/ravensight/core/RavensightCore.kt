@@ -11,6 +11,8 @@ class RavensightEvent(
     val data: Map<String, Any?>,
     /** Unix seconds, captured when the event happened. */
     val timestampSec: Long,
+    /** An automatic error capture: gameplay events keep their place ahead of it. */
+    val auto: Boolean = false,
 )
 
 /**
@@ -133,10 +135,10 @@ sealed class BatchOutcome {
     /** 429: the queue is held until the retry window passes. */
     class RateLimited(val reason: String) : BatchOutcome()
 
-    /** 400 on a multi-event batch: the next batch is halved to [newLimit]. */
+    /** 400 or 413 on a multi-event batch: the next batch is halved to [newLimit]. */
     class BatchSplit(val newLimit: Int) : BatchOutcome()
 
-    /** 400 on a single event: that event was dropped so it cannot block the queue. */
+    /** 400 or 413 on a single event: that event was dropped so it cannot block the queue. */
     object EventRejected : BatchOutcome()
 
     /** Anything else: backoff scheduled, the batch stays queued. */
@@ -160,7 +162,7 @@ class RavensightStats(
  * queue, batching in fifties, the server kill switch, session lifecycle,
  * re-authentication on a batch 401, a refused key that stops automatic
  * retries, Retry-After on 429 and 503, exponential backoff from 10s to a 5
- * minute ceiling, and oversize splitting on 400.
+ * minute ceiling, and oversize splitting on 400 and 413.
  *
  * This class performs no I/O and imports nothing from Android. A driver loop
  * (the Ravensight class in the Android module, or a unit test) repeatedly asks
@@ -273,23 +275,38 @@ class RavensightCore(
      * settings check has answered. [timestampSec] is when the event
      * happened, in Unix seconds; null means now. [atHead] puts the event
      * first in the queue (used for game_started, which opens a session).
-     * Returns false when tracking is off, and never throws: a blank name
-     * also returns false.
+     * [auto] marks an automatic error capture: on a full queue an incoming
+     * capture is itself dropped, and a gameplay event drops the oldest
+     * queued capture before any gameplay event, so an error storm never
+     * pushes gameplay out. Returns false when tracking is off, and never
+     * throws: a blank name also returns false.
      */
     fun track(
         name: String,
         data: Map<String, Any?> = emptyMap(),
         timestampSec: Long? = null,
         atHead: Boolean = false,
+        auto: Boolean = false,
     ): Boolean {
         if (name.isBlank()) return false
         if (!isActive) return false
 
         while (queue.size >= queueCap) {
-            queue.removeFirst()
+            if (auto) {
+                dropped++
+                return false
+            }
+            var at = -1
+            for (i in inFlightBatchSize until queue.size) {
+                if (queue[i].auto) {
+                    at = i
+                    break
+                }
+            }
+            if (at >= 0) queue.removeAt(at) else queue.removeFirst()
             dropped++
         }
-        val event = RavensightEvent(name, data, timestampSec ?: (nowMs() / 1000L))
+        val event = RavensightEvent(name, data, timestampSec ?: (nowMs() / 1000L), auto)
         if (atHead) queue.addFirst(event) else queue.addLast(event)
         return true
     }
@@ -538,7 +555,9 @@ class RavensightCore(
                 return BatchOutcome.RateLimited(errorCode ?: "rate_limited")
             }
 
-            400 -> {
+            // A 413 (body too large) is the same problem as a 400: split,
+            // then drop the one bad event, never retry it as is.
+            400, 413 -> {
                 if (batchSize > 1) {
                     batchLimit = (batchSize / 2).coerceAtLeast(1)
                     return BatchOutcome.BatchSplit(batchLimit)

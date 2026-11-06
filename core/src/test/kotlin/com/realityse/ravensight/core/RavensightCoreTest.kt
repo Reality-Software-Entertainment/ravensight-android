@@ -800,4 +800,37 @@ class RavensightCoreTest {
         c.countDropped(2)
         assertEquals(2L, c.stats.dropped)
     }
+
+    // --- Automatic errors in the queue ------------------------------------------
+
+    @Test
+    fun `a 413 is split and dropped like a 400, never retried as is`() {
+        val c = booted()
+        repeat(4) { c.track("e$it") }
+        c.nextAction()
+        assertTrue(c.onBatchResult(413) is BatchOutcome.BatchSplit)
+        assertEquals(2, (c.nextAction() as RavensightAction.SendBatch).events.size)
+        assertTrue(c.onBatchResult(413) is BatchOutcome.BatchSplit)
+        assertEquals(1, (c.nextAction() as RavensightAction.SendBatch).events.size)
+        assertEquals(BatchOutcome.EventRejected, c.onBatchResult(413))
+        assertEquals(3, c.queueSize)
+        assertEquals(0L, c.retryInMs)
+    }
+
+    @Test
+    fun `gameplay events keep their place ahead of automatic errors on a full queue`() {
+        val c = core(RavensightCoreConfig(maxQueueSize = 3, random = { 0.5 }))
+        c.track("a")
+        assertTrue(c.track("error", auto = true))
+        c.track("b")
+        // Full: an incoming capture is dropped, a gameplay event evicts the capture.
+        assertFalse(c.track("error", auto = true))
+        assertTrue(c.track("c"))
+        c.onSettingsResult(200, true)
+        c.nextAction()
+        c.onSessionResult(201, "t", expiresInSec = 3600)
+        val batch = c.nextAction() as RavensightAction.SendBatch
+        assertEquals(listOf("a", "b", "c"), batch.events.map { it.name })
+        assertEquals(2L, c.stats.dropped)
+    }
 }
