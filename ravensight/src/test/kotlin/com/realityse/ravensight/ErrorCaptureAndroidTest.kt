@@ -164,7 +164,7 @@ class ErrorCaptureAndroidTest {
         assertTrue(data.getString("rs_stack").contains("at "))
         assertFalse(data.has("rs_trail"))
         assertFalse(data.has("rs_fp"))
-        assertEquals((now - 60_000) / 1000, events[0].getLong("timestamp"))
+        assertEquals(now - 60_000, events[0].getLong("timestamp")) // the crash time, in milliseconds
         assertEquals(0, crashFiles())
         // Gameplay first: game_started opens the batch, the error follows.
         val first = JSONObject(http.requests.first { it.path == "/track/batch" }.body!!).getJSONArray("events")

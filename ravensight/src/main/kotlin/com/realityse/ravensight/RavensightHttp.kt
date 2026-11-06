@@ -3,6 +3,7 @@ package com.realityse.ravensight
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import com.realityse.ravensight.core.RavensightWire
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -56,7 +57,10 @@ internal class RavensightHttp(private val timeoutMs: Int) : RavensightTransport 
             if (body != null) {
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json")
-                connection.outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
+                val bytes = body.toByteArray(StandardCharsets.UTF_8)
+                // The driver marks a body to compress with Content-Encoding: gzip.
+                val sent = if (headers["Content-Encoding"] == "gzip") RavensightWire.gzip(bytes) else bytes
+                connection.outputStream.use { it.write(sent) }
             }
 
             val status = connection.responseCode

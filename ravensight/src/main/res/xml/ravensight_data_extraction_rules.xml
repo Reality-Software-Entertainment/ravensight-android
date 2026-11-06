@@ -2,15 +2,17 @@
 <!--
     Backup and device transfer rules for Android 12 and above
     (android:dataExtractionRules). Keeps the Ravensight device id, the
-    player's opt-out and the exit marker out of cloud backup and device
-    transfer. Copy the exclude lines into your own rules file if you already
+    player's opt-out, the exit marker and the queue file (which holds an
+    origin stamp) out of cloud backup and device transfer. Copy the exclude lines into your own rules file if you already
     have one.
 -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="ravensight.xml" />
+        <exclude domain="file" path="ravensight/" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="ravensight.xml" />
+        <exclude domain="file" path="ravensight/" />
     </device-transfer>
 </data-extraction-rules>

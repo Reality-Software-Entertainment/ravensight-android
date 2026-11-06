@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+Implements the Ravensight delivery, ads and attribution, exposure and
+device field contracts.
+
+### Added
+
+- Persisted queue, on by default (`persistQueue`): queue format version 2,
+  one file per ingest key, atomic, 500 events, 89 days, each group with its
+  session's `origin`; events tracked under an earlier session are sent with
+  that origin. Excluded from Auto Backup by the shipped rules.
+- gzip of batch bodies of 1,024 bytes or more; a `415` resends plain.
+- Request signing when the session answer carries `signing`: HMAC-SHA256
+  over the uncompressed body, clock corrected by `serverTime`, secret in
+  memory only. Passes every vector in `delivery-vectors.json`.
+- `trackAd`, `trackAdRevenue`, `setAttribution`, `RavensightAd` (micros with
+  `BigDecimal`, format mapping) and adapters for AdMob, AppLovin MAX,
+  ironSource LevelPlay and TopOn that take callback values (no mediation
+  SDK is linked).
+- `sendDeviceInfo` (on): `Build.MODEL` and `Build.VERSION.RELEASE` on the
+  session.
+
+### Changed
+
+- Event timestamps are unix milliseconds.
+- Exposure tagging follows the exposure contract: no tag until the first
+  `getConfig` in a run, one `rs_exposure` then, stopped experiments
+  untagged, and a well-formed `rs_exp_` value from the game kept.
+- Response handling follows the delivery contract: `400` with `index` drops
+  that event, another non-split `400` drops the request's events, `413`
+  splits, one session reopen per `401`, a batch `403` keeps the events.
+- Gameplay events now queue ahead of automatic error captures, not only
+  outlive them at the cap, and never inside a batch in flight. The queue
+  file keeps the capture flag, so the rule holds after a restart.
+- Error captures are queued with their capture time in milliseconds.
+- On a full queue an incoming capture now evicts the oldest queued capture
+  (it was dropped before); with no capture queued it is still dropped, and a
+  capture never evicts a gameplay event.
+- An error's `rs_trail` is never written to the queue file; a capture
+  restored from it is sent without its trail.
+- Backoff jitter is a factor in [0.5, 1) (was plus or minus 20 percent);
+  `flush()` cuts a backoff short but never a `Retry-After` wait.
+- The 8 KB event check counts an error event's message, stack and trail
+  one byte a character, as the server does.
 ## [0.4.0] - 2026-11-06
 
 - Automatic error capture, on by default: a chained uncaught exception handler records a crash synchronously to app-private storage and sends it on the next launch as one `error` event (`rs_source` `crash`, `rs_severity` `critical`). The app still crashes as before.
