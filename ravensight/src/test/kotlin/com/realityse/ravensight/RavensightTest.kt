@@ -1023,7 +1023,7 @@ class RavensightTest {
 
     @Test
     fun `the version constant is 0_3_0`() {
-        assertEquals("0.3.1", Ravensight.VERSION)
+        assertEquals("0.4.0", Ravensight.VERSION)
     }
 
     // --- 0.3.0 public build rules ------------------------------------------

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.4.0] - 2026-11-06
 
 - Automatic error capture, on by default: a chained uncaught exception handler records a crash synchronously to app-private storage and sends it on the next launch as one `error` event (`rs_source` `crash`, `rs_severity` `critical`). The app still crashes as before.
 - On API 30 and later, native crashes and ANRs from `ApplicationExitInfo` are reported once each since the last look, with only the platform's short description.
