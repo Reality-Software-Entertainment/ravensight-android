@@ -172,6 +172,7 @@ callbacks are delivered on the main thread.
 | `optional` | off | Silences the one warning a blank `ingestKey` logs. |
 | `consent` | `OPT_OUT` | `RavensightConsent.OPT_IN` saves nothing, creates no device id and sends nothing until `setTrackingEnabled(context, true)`. See "Public builds". |
 | `distribution` | null | A short label for where this build was distributed, such as `"play-store"`, sent when a session opens. At most 40 characters, no control characters; anything else is ignored with one warning. |
+| `captureErrors` | on | Automatic error capture: crashes, and on API 30 and later native crashes and ANRs. See "Automatic error capture". `trackError` works either way. |
 
 ## About your ingest key
 
@@ -280,6 +281,65 @@ from process start to `initialize`. Nothing is sent if no sample was taken.
 
 ```kotlin
 Ravensight.initialize(this, RavensightConfig(ingestKey = "gt_live_...", performance = true))
+```
+
+## Automatic error capture
+
+On by default, with no code. Each captured error is one ordinary `error`
+event on your event meter, and spend is bounded on the device.
+
+What is captured:
+
+* **Crashes.** The SDK chains `Thread.setDefaultUncaughtExceptionHandler`.
+  On an uncaught exception it writes the crash to app-private storage
+  (`noBackupFilesDir`, never backed up) synchronously, then calls the
+  handler that was there before, so your app crashes exactly as it would
+  without Ravensight. The next launch sends it: `rs_source` `crash`,
+  `rs_severity` `critical`, the exception's class as `rs_error_type`, its
+  message and the start of its stack.
+* **Native crashes and ANRs**, on Android 11 (API 30) and later. At launch
+  the SDK reads `ActivityManager.getHistoricalProcessExitReasons` and
+  reports each `REASON_CRASH_NATIVE` and `REASON_ANR` exit newer than the
+  last one it looked at, once, as `rs_source` `crash` with `rs_error_type`
+  `REASON_CRASH_NATIVE` or `REASON_ANR` and the platform's short
+  description. No tombstone or trace is read. The first look on an install
+  only records where to start. Below API 30 this is skipped.
+
+When it runs: only with an ingest key, with the player's consent, with
+`captureErrors` on and while your game's Error capture switch in the
+dashboard is on. The switch arrives with the settings and session answers;
+until then at most 5 captures wait in memory and are sent once the answer
+says on, or discarded unsent if it says off. An opt-out or
+`resetDeviceId` deletes a stored crash. The SDK's own worker thread and
+its own requests are never captured.
+
+Limits per session: 30 captures, 3 per error (type, message pattern and
+first frame of your code), 10 with a trail, and at most 6 a minute. Over a
+limit the capture is dropped on the device. On a full queue your gameplay
+events keep their place and captures are dropped first.
+
+What is never sent: before queueing, the SDK replaces emails with
+`[email]`, bearer tokens, JWTs, `gt_` keys and long runs that look like
+secrets with `[token]`, IP addresses with `[ip]` and home directories with
+`~`, and drops a URL's query and fragment. The message is cut to 200
+characters and the stack to 2,000. Text you pass to `trackError` is sent as
+you wrote it and scrubbed by the server.
+
+The trail. When your game's trail switch is on, the SDK keeps the last 20
+lines in memory: each event your code tracks and each `Ravensight.log`
+call, as `+<ms since session start> <level> <text>`, scrubbed and cut to
+120 characters. A crash carries the trail with it, written in the same
+crash record, and it is never sent on its own. The SDK cannot read your
+app's Logcat output, so `Ravensight.log` is the way to add context:
+
+```kotlin
+Ravensight.log("info", "entered level 3")
+```
+
+To turn capture off for a build:
+
+```kotlin
+Ravensight.initialize(this, RavensightConfig(ingestKey = "gt_live_...", captureErrors = false))
 ```
 
 ## Status and failures
@@ -395,7 +455,7 @@ What 0.3.0 adds to every build, public or not:
   process dies is gone.
 * **Session expiry.** A batch `401` clears the session, opens a new one and
   re sends the same batch, at most twice in a row before backing off.
-* **Oversize batches.** A `400` halves the batch and retries down to a single
+* **Oversize batches.** A `400` or `413` halves the batch and retries down to a single
   event. An event still rejected on its own is dropped and counted, so it
   cannot block everything behind it.
 * **Timestamps.** Each event carries the Unix time, in seconds, at which it
