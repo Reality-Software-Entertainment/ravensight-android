@@ -11,9 +11,12 @@ package com.realityse.ravensight.core
  *  3. An email address becomes `[email]`.
  *  4. `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` become `~`.
  *  5. IPv4 and IPv6 addresses (with a digit) become `[ip]`.
- *  6. A run of 32 or more characters from `[A-Za-z0-9+=_-]` that contains
- *     at least one digit becomes `[token]`. `/` is not in the class, so a
- *     file path survives, and a run with no digit is an identifier.
+ *  6. A run of 32 or more characters from `[A-Za-z0-9+/=_-]` that contains
+ *     at least one digit becomes `[token]`, unless it contains `/` and every
+ *     `/` piece is empty or a path word under 32 characters (lower snake or
+ *     kebab case, PascalCase, or 1 to 6 capitals and digits), so a file path
+ *     survives but a secret with slashes does not. A run with no digit is an
+ *     identifier and stays.
  *
  * Manual `trackError` text is not scrubbed here: the server scrubs it.
  */
@@ -28,8 +31,17 @@ object ErrorScrub {
     private val IPV4 = Regex("""\b(?:\d{1,3}\.){3}\d{1,3}\b""")
     private val IPV6_FULL = Regex("""\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b""")
     private val IPV6_SHORT = Regex("""(?:\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6}\b)?""")
-    private val LONG_RUN = Regex("""[A-Za-z0-9+=_-]{32,}""")
+    private val LONG_RUN = Regex("""[A-Za-z0-9+/=_-]{32,}""")
     private val DIGIT = Regex("""\d""")
+    private val PATH_WORDS = listOf(
+        Regex("""^[a-z0-9]+([_-][a-z0-9]+)*$"""),
+        Regex("""^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$"""),
+        Regex("""^[A-Z0-9]{1,6}$"""),
+    )
+
+    private fun isPath(run: String): Boolean = run.contains('/') && run.split('/').all { piece ->
+        piece.isEmpty() || (piece.length < 32 && PATH_WORDS.any { it.matches(piece) })
+    }
 
     @JvmStatic
     fun scrub(text: String): String {
@@ -44,7 +56,7 @@ object ErrorScrub {
         out = IPV4.replace(out, "[ip]")
         out = IPV6_FULL.replace(out, "[ip]")
         out = IPV6_SHORT.replace(out) { if (DIGIT.containsMatchIn(it.value)) "[ip]" else it.value }
-        out = LONG_RUN.replace(out) { if (DIGIT.containsMatchIn(it.value)) "[token]" else it.value }
+        out = LONG_RUN.replace(out) { if (DIGIT.containsMatchIn(it.value) && !isPath(it.value)) "[token]" else it.value }
         return out
     }
 

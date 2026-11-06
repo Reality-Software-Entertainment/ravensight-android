@@ -36,6 +36,41 @@ class ErrorCaptureTest {
         for ((input, output) in cases) assertEquals(input, output, ErrorScrub.scrub(input))
     }
 
+    /** Every case in the shared fixture (docs/errors/scrub-vectors.json), exactly. */
+    @Test
+    fun `scrub matches every shared vector`() {
+        val json = javaClass.classLoader!!.getResource("scrub-vectors.json")!!.readText()
+        val cases = Regex(""""in"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"out"\s*:\s*("(?:[^"\\]|\\.)*")""")
+            .findAll(json).map { unquote(it.groupValues[1]) to unquote(it.groupValues[2]) }.toList()
+        assertTrue(cases.size >= 18)
+        for ((input, output) in cases) assertEquals(input, output, ErrorScrub.scrub(input))
+    }
+
+    /** A JSON string literal's value: enough of JSON for the fixture. */
+    private fun unquote(literal: String): String {
+        val body = literal.substring(1, literal.length - 1)
+        val out = StringBuilder()
+        var i = 0
+        while (i < body.length) {
+            val ch = body[i]
+            if (ch != '\\') { out.append(ch); i++; continue }
+            when (val esc = body[i + 1]) {
+                'n' -> out.append('\n')
+                't' -> out.append('\t')
+                'u' -> { out.append(body.substring(i + 2, i + 6).toInt(16).toChar()); i += 4 }
+                else -> out.append(esc)
+            }
+            i += 2
+        }
+        return out.toString()
+    }
+
+    @Test
+    fun `scrub turns secrets with slashes into tokens`() {
+        assertEquals("aws [token] leaked", ErrorScrub.scrub("aws wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY1 leaked"))
+        assertEquals("~/Projects/game2/src/levels/level_10_boss.gd", ErrorScrub.scrub("/Users/jacob/Projects/game2/src/levels/level_10_boss.gd"))
+    }
+
     @Test
     fun `scrub leaves identifiers, frames and long paths with digits alone`() {
         val keep = listOf(
