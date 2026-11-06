@@ -312,11 +312,33 @@ class ErrorCaptureAndroidTest {
 
     @Test
     fun `stored crashes belong to the process that wrote them`() {
+        // The game's process is the declared default one; the service's read never takes it.
         val service = CrashStore(app, "com.example.game:sync")
-        val game = CrashStore(app, "com.example.game")
-        service.write(com.realityse.ravensight.core.AutoError.crash(RuntimeException("service"), now))
+        val game = CrashStore(app, app.packageName)
+        game.write(com.realityse.ravensight.core.AutoError.crash(RuntimeException("game"), now))
+        assertTrue(service.takeAll().isEmpty())
+        assertEquals("game", game.takeAll().single().message)
+    }
+
+    @Test
+    fun `clear from one process deletes every process's records`() {
+        val service = CrashStore(app, "com.example.game:sync")
+        val game = CrashStore(app, app.packageName)
+        service.write(com.realityse.ravensight.core.AutoError.crash(RuntimeException("a"), now))
+        game.write(com.realityse.ravensight.core.AutoError.crash(RuntimeException("b"), now))
+        assertEquals(2, crashFiles())
+        game.clear()
+        assertEquals(0, crashFiles())
+        assertFalse(crashDir().exists())
+    }
+
+    @Test
+    fun `launch prunes undeclared processes and records past retention`() {
+        CrashStore(app, "com.gone.process").write(com.realityse.ravensight.core.AutoError.crash(RuntimeException("gone"), now))
+        val game = CrashStore(app, app.packageName, nowMs = { System.currentTimeMillis() + CrashStore.RETENTION_MS + 60_000 })
+        game.write(com.realityse.ravensight.core.AutoError.crash(RuntimeException("old"), now))
         assertTrue(game.takeAll().isEmpty())
-        assertEquals("service", service.takeAll().single().message)
+        assertEquals(0, crashFiles())
     }
 
     @Test

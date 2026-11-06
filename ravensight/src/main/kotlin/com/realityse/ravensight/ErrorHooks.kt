@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.app.Application
 import android.app.ApplicationExitInfo
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.StrictMode
 import com.realityse.ravensight.core.AutoError
@@ -86,11 +87,13 @@ internal fun currentProcessName(context: Context): String {
  * process's crash is never sent as the game's, at most [MAX_FILES] at a
  * time, deleted when read.
  */
-internal class CrashStore(context: Context, processName: String = currentProcessName(context)) {
-    private val dir = File(
-        File(context.noBackupFilesDir ?: context.filesDir, "ravensight_crashes"),
-        processName.replace(Regex("[^A-Za-z0-9._-]"), "_"),
-    )
+internal class CrashStore(
+    private val context: Context,
+    processName: String = currentProcessName(context),
+    private val nowMs: () -> Long = { System.currentTimeMillis() },
+) {
+    private val root = File(context.noBackupFilesDir ?: context.filesDir, "ravensight_crashes")
+    private val dir = File(root, safeName(processName))
 
     /**
      * Called on the crashing thread. Disk access is allowed for the write,
@@ -123,8 +126,18 @@ internal class CrashStore(context: Context, processName: String = currentProcess
         tmp.renameTo(File(dir, "$name.json"))
     }
 
-    /** Every stored crash, oldest first; the files are deleted whatever they hold. */
+    /**
+     * Every stored crash of this process, oldest first; the files are
+     * deleted whatever they hold. Also prunes other processes' records:
+     * a directory for a process the app no longer declares, and any record
+     * older than [RETENTION_MS].
+     */
     fun takeAll(): List<AutoError> {
+        try {
+            prune()
+        } catch (_: Throwable) {
+            // Pruning is best effort.
+        }
         val files = dir.listFiles() ?: return emptyList()
         val out = ArrayList<AutoError>()
         for (file in files.sortedBy { it.name }) {
@@ -151,12 +164,49 @@ internal class CrashStore(context: Context, processName: String = currentProcess
         return out.sortedBy { it.atMs }
     }
 
+    /** Opt-out or a new identity: every process's records go, not only this one's. */
     fun clear() {
-        dir.listFiles()?.forEach { it.delete() }
+        root.deleteRecursively()
+    }
+
+    private fun prune() {
+        val declared = declaredProcesses()
+        val cutoff = nowMs() - RETENTION_MS
+        for (sub in root.listFiles() ?: return) {
+            if (!sub.isDirectory || (declared != null && sub.name !in declared)) {
+                sub.deleteRecursively()
+                continue
+            }
+            sub.listFiles()?.forEach { if (it.lastModified() < cutoff) it.delete() }
+            if (sub.list()?.isEmpty() == true) sub.delete()
+        }
+    }
+
+    /** Directory names of every process the manifest declares, the default one included; null if unreadable. */
+    private fun declaredProcesses(): Set<String>? = try {
+        val flags = PackageManager.GET_ACTIVITIES or PackageManager.GET_SERVICES or
+            PackageManager.GET_RECEIVERS or PackageManager.GET_PROVIDERS
+        @Suppress("DEPRECATION")
+        val info = context.packageManager.getPackageInfo(context.packageName, flags)
+        val names = HashSet<String>()
+        names += context.packageName
+        info.applicationInfo?.processName?.let { names += it }
+        info.activities?.forEach { names += it.processName }
+        info.services?.forEach { names += it.processName }
+        info.receivers?.forEach { names += it.processName }
+        info.providers?.forEach { names += it.processName }
+        names.filterNotNull().map(::safeName).toSet()
+    } catch (_: Throwable) {
+        null
     }
 
     companion object {
         const val MAX_FILES = 5
+
+        /** A crash record not sent within this long is deleted unsent. */
+        const val RETENTION_MS: Long = 30L * 24 * 60 * 60 * 1000
+
+        fun safeName(processName: String): String = processName.replace(Regex("[^A-Za-z0-9._-]"), "_")
     }
 }
 

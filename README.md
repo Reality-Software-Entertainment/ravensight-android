@@ -310,7 +310,9 @@ When it runs: only with an ingest key, with the player's consent, with
 dashboard is on. The switch arrives with the settings and session answers;
 until then at most 5 captures wait in memory and are sent once the answer
 says on, or discarded unsent if it says off. An opt-out or
-`resetDeviceId` deletes a stored crash. The SDK's own worker thread and
+`resetDeviceId` deletes every stored crash, from every process of the app.
+Crash records are kept per process; a record of a process the app no longer
+declares, or one older than 30 days, is deleted unsent at launch. The SDK's own worker thread and
 its own requests are never captured.
 
 Limits per session: 30 captures, 3 per error (type, message pattern and
