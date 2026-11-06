@@ -328,8 +328,12 @@ you wrote it and scrubbed by the server.
 The trail. When your game's trail switch is on, the SDK keeps the last 20
 lines in memory: each event your code tracks and each `Ravensight.log`
 call, as `+<ms since session start> <level> <text>`, scrubbed and cut to
-120 characters. A crash carries the trail with it, written in the same
-crash record, and it is never sent on its own. The SDK cannot read your
+120 characters. A crash carries the trail with it, and it is never sent on its own.
+The trail is written to disk only inside a pending crash record: already
+scrubbed, in app-private `noBackupFilesDir`, only while the trail switch is
+on, and deleted when the next launch picks the record up for sending or on
+an opt-out. If the switch is off by the time it is sent, the trail is
+left out. The SDK cannot read your
 app's Logcat output, so `Ravensight.log` is the way to add context:
 
 ```kotlin
