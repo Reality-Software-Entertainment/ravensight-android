@@ -148,4 +148,20 @@ class RavensightWaveCoreTest {
         assertEquals(listOf("play_1", "play_2", "play_3"), c.snapshot().map { it.name })
         assertEquals(3L, c.stats.dropped)
     }
+
+    @Test
+    fun `a capture in a batch in flight is never evicted`() {
+        val c = booted(cap = 2)
+        open(c)
+        c.track("capture_1", auto = true)
+        val batch = c.nextAction() as RavensightAction.SendBatch
+        assertEquals(listOf("capture_1"), batch.events.map { it.name })
+        c.track("play")
+        assertFalse("the only capture is in flight: the incoming one is dropped", c.track("capture_2", auto = true))
+        assertEquals(listOf("capture_1", "play"), c.snapshot().map { it.name })
+        c.track("play_2") // full: the oldest event that is not the capture in flight goes
+        assertEquals(listOf("capture_1", "play_2"), c.snapshot().map { it.name })
+        c.onBatchResult(202)
+        assertEquals(listOf("play_2"), c.snapshot().map { it.name })
+    }
 }

@@ -342,7 +342,7 @@ class RavensightCore(
                 dropped++
                 return false
             }
-            if (at >= 0) queue.removeAt(at) else queue.removeFirst()
+            queue.removeAt(if (at >= 0) at else oldestNotInFlightCapture())
             dropped++
         }
         val event = RavensightEvent(
@@ -358,6 +358,12 @@ class RavensightCore(
         }
         revision++
         return true
+    }
+
+    /** The oldest event that is not a capture in the batch in flight. */
+    private fun oldestNotInFlightCapture(): Int {
+        for (i in queue.indices) if (!(i < inFlightBatchSize && queue[i].auto)) return i
+        return 0
     }
 
     /** The first queued automatic error outside a batch in flight, or -1. */
