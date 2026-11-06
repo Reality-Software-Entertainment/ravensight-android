@@ -34,14 +34,18 @@ object ErrorScrub {
     private val IPV6_SHORT = Regex("""(?:\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6}\b)?""")
     private val LONG_RUN = Regex("""[A-Za-z0-9+/=_-]{32,}""")
     private val DIGIT = Regex("""\d""")
-    private val PATH_WORDS = listOf(
-        Regex("""^[a-z0-9]+([_-][a-z0-9]+)*$"""),
+    // A path word is one or more parts joined by '_' or '-', each part
+    // lowercase, CamelCase, or an acronym of 1 to 6 capitals or digits.
+    private val PATH_PARTS = listOf(
+        Regex("""^[a-z0-9]+$"""),
         Regex("""^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$"""),
         Regex("""^[A-Z0-9]{1,6}$"""),
     )
 
     private fun isPath(run: String): Boolean = run.contains('/') && run.split('/').all { piece ->
-        piece.isEmpty() || (piece.length < 32 && PATH_WORDS.any { it.matches(piece) })
+        piece.isEmpty() || (piece.length < 32 && piece.split('_', '-').all { part ->
+            part.isNotEmpty() && PATH_PARTS.any { it.matches(part) }
+        })
     }
 
     @JvmStatic
