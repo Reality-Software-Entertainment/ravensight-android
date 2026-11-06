@@ -221,6 +221,21 @@ class ErrorCaptureAndroidTest {
     }
 
     @Test
+    fun `many trail lines never push out a crash`() {
+        answer = JSONObject().put("enabled", true).put("trail", true)
+        init()
+        foreground()
+        repeat(5_000) { Ravensight.log("info", "frame $it") }
+        crash(RuntimeException("the real one"))
+        relaunch()
+        init()
+        foreground()
+        val data = errorEvents().single().getJSONObject("data")
+        assertEquals("the real one", data.getString("rs_message"))
+        assertEquals(20, data.getString("rs_trail").lines().size)
+    }
+
+    @Test
     fun `the trail rides on a crash only when the game's trail switch is on`() {
         answer = JSONObject().put("enabled", true).put("trail", true)
         init()
