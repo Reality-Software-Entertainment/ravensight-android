@@ -9,7 +9,10 @@ package com.realityse.ravensight.core
  *  1. A URL (`scheme://...`) loses any `user:password@`, its query and its fragment.
  *  2. `Bearer <token>`, a JWT-shaped string and a `gt_` key become `[token]`.
  *  3. An email address becomes `[email]`.
- *  4. `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` become `~`.
+ *  4. `/Users/<name>`, `/home/<name>`, `C:\Users\<name>` and
+ *     `C:\Documents and Settings\<name>` become `~`. The name is the whole
+ *     segment up to the next slash, quote, `<`, `>`, `:` or end of line,
+ *     spaces included (contract 5): a name can be `Jo Ann`.
  *  5. IPv4 addresses, and IPv6 addresses with a digit (so `Face::Add`
  *     stays), become `[ip]`.
  *  6. A run of 32 or more characters from `[A-Za-z0-9+/=_-]` that contains
@@ -27,8 +30,8 @@ object ErrorScrub {
     private val JWT = Regex("""\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*""")
     private val GT_KEY = Regex("""\bgt_[A-Za-z0-9_]+""")
     private val EMAIL = Regex("""[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}""")
-    private val HOME_UNIX = Regex("""/(?:Users|home)/[^/\s'"]+""")
-    private val HOME_WINDOWS = Regex("""\b[A-Za-z]:[\\/][Uu][Ss][Ee][Rr][Ss][\\/][^\\/\s'"]+""")
+    private val HOME_UNIX = Regex("""/(?:Users|home)/[^/\\'"<>:\r\n]+""")
+    private val HOME_WINDOWS = Regex("""\b[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^/\\'"<>:\r\n]+""", RegexOption.IGNORE_CASE)
     private val IPV4 = Regex("""\b(?:\d{1,3}\.){3}\d{1,3}\b""")
     private val IPV6_FULL = Regex("""\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b""")
     private val IPV6_SHORT = Regex("""(?:\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6}\b)?""")

@@ -322,8 +322,8 @@ events keep their place and captures are dropped first.
 
 What is never sent: before queueing, the SDK replaces emails with
 `[email]`, bearer tokens, JWTs, `gt_` keys and long runs that look like
-secrets with `[token]`, IP addresses with `[ip]` and home directories with
-`~`, and drops a URL's query and fragment. The message is cut to 200
+secrets with `[token]`, IP addresses with `[ip]` and home directories (the
+whole name, spaces included) with `~`, and drops a URL's query and fragment. The message is cut to 200
 characters and the stack to 2,000. Text you pass to `trackError` is sent as
 you wrote it and scrubbed by the server.
 

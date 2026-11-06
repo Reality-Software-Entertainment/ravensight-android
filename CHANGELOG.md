@@ -5,6 +5,7 @@
 - Automatic error capture, on by default: a chained uncaught exception handler records a crash synchronously to app-private storage and sends it on the next launch as one `error` event (`rs_source` `crash`, `rs_severity` `critical`). The app still crashes as before.
 - On API 30 and later, native crashes and ANRs from `ApplicationExitInfo` are reported once each since the last look, with only the platform's short description.
 - Capture runs only with a key, consent, `captureErrors` (new, default on) and the game's `errorCapture` switch; up to 5 boot captures wait for the settings or session answer. Device caps and the contract's scrub apply before queueing.
+- A home folder scrubs as the whole name, spaces included, and `C:\Documents and Settings\<name>` is a home folder (scrub contract 5).
 - Add `Ravensight.log(level, message)` for the in-memory error trail (sent with a crash only when the game's trail switch is on).
 - Gameplay events keep their place ahead of automatic errors on a full queue. A `413` is split and dropped like a `400`.
 
