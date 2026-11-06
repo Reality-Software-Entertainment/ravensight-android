@@ -10,7 +10,8 @@ package com.realityse.ravensight.core
  *  2. `Bearer <token>`, a JWT-shaped string and a `gt_` key become `[token]`.
  *  3. An email address becomes `[email]`.
  *  4. `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` become `~`.
- *  5. IPv4 and IPv6 addresses (with a digit) become `[ip]`.
+ *  5. IPv4 addresses, and IPv6 addresses with a digit (so `Face::Add`
+ *     stays), become `[ip]`.
  *  6. A run of 32 or more characters from `[A-Za-z0-9+/=_-]` that contains
  *     at least one digit becomes `[token]`, unless it contains `/` and every
  *     `/` piece is empty or a path word under 32 characters (lower snake or
@@ -54,15 +55,18 @@ object ErrorScrub {
         out = HOME_WINDOWS.replace(out, "~")
         out = HOME_UNIX.replace(out, "~")
         out = IPV4.replace(out, "[ip]")
-        out = IPV6_FULL.replace(out, "[ip]")
+        out = IPV6_FULL.replace(out) { if (DIGIT.containsMatchIn(it.value)) "[ip]" else it.value }
         out = IPV6_SHORT.replace(out) { if (DIGIT.containsMatchIn(it.value)) "[ip]" else it.value }
         out = LONG_RUN.replace(out) { if (DIGIT.containsMatchIn(it.value) && !isPath(it.value)) "[token]" else it.value }
         return out
     }
 
-    /** Scrub, then cut to [max] code points. */
+    /**
+     * Cut to 4 times [max], scrub, then cut to [max] code points. The first
+     * cut bounds the regex work on a huge input.
+     */
     @JvmStatic
-    fun clean(text: String, max: Int): String = cut(scrub(text), max)
+    fun clean(text: String, max: Int): String = cut(scrub(cut(text, max * 4)), max)
 
     /** Cuts to at most [max] code points, never splitting a surrogate pair. */
     @JvmStatic

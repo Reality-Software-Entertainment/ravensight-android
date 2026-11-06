@@ -129,7 +129,7 @@ object ExitReasons {
     private fun toError(record: ExitRecord): AutoError {
         val native = record.reason == REASON_CRASH_NATIVE
         val label = if (native) "Native crash" else "ANR"
-        val description = record.description?.replace(Regex("""\s+"""), " ")?.trim().orEmpty()
+        val description = record.description?.let { ErrorScrub.cut(it, ErrorCaps.MAX_MESSAGE_CHARS * 4) }?.replace(Regex("""\s+"""), " ")?.trim().orEmpty()
         return AutoError.of(
             source = EventSource.CRASH,
             severity = Severity.CRITICAL,
@@ -150,7 +150,7 @@ class TrailRing {
 
     @Synchronized
     fun add(sinceStartMs: Long, level: String, text: String) {
-        val flat = text.replace(Regex("""\s+"""), " ").trim()
+        val flat = ErrorScrub.cut(text, ErrorCaps.MAX_TRAIL_LINE_CHARS * 4).replace(Regex("""\s+"""), " ").trim()
         val line = "+${sinceStartMs.coerceAtLeast(0L)} ${level.trim().ifEmpty { "info" }} $flat"
         lines.addLast(ErrorScrub.clean(line, ErrorCaps.MAX_TRAIL_LINE_CHARS))
         while (lines.size > ErrorCaps.TRAIL_LINES) lines.removeFirst()

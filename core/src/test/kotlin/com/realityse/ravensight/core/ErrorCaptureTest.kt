@@ -42,7 +42,7 @@ class ErrorCaptureTest {
         val json = javaClass.classLoader!!.getResource("scrub-vectors.json")!!.readText()
         val cases = Regex(""""in"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"out"\s*:\s*("(?:[^"\\]|\\.)*")""")
             .findAll(json).map { unquote(it.groupValues[1]) to unquote(it.groupValues[2]) }.toList()
-        assertTrue(cases.size >= 18)
+        assertTrue(cases.size >= 20)
         for ((input, output) in cases) assertEquals(input, output, ErrorScrub.scrub(input))
     }
 
@@ -63,6 +63,28 @@ class ErrorCaptureTest {
             i += 2
         }
         return out.toString()
+    }
+
+    @Test
+    fun `a 200,000 character input is cut before scrubbing and stays fast`() {
+        val huge = "a1:".repeat(40_000) + "x@y.io " + "Z".repeat(80_000)
+        val started = System.nanoTime()
+        val e = AutoError.of("crash", "critical", huge, stack = huge, type = huge, trail = huge, atMs = now)
+        val ring = TrailRing()
+        ring.add(0, "info", huge)
+        val ms = (System.nanoTime() - started) / 1_000_000
+        assertTrue("took $ms ms", ms < 2_000)
+        assertTrue(e.message.length <= ErrorCaps.MAX_MESSAGE_CHARS)
+        assertTrue(e.stack!!.length <= ErrorCaps.MAX_STACK_CHARS)
+        assertTrue(ring.text()!!.length <= ErrorCaps.MAX_TRAIL_LINE_CHARS)
+        assertTrue(ErrorScrub.clean(huge, 200).length <= 200)
+    }
+
+    @Test
+    fun `ipv6 needs a digit`() {
+        assertEquals("at Face::Add (face.cpp:12)", ErrorScrub.scrub("at Face::Add (face.cpp:12)"))
+        assertEquals("dead:beef:cafe:face:dead:beef:cafe:face", ErrorScrub.scrub("dead:beef:cafe:face:dead:beef:cafe:face"))
+        assertEquals("[ip]", ErrorScrub.scrub("fe80::1"))
     }
 
     @Test
