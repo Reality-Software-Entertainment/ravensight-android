@@ -108,8 +108,13 @@ class RavensightReportsTest {
     @Test fun bitmapHelperCapturesOnceAndRefusesUnusableCapture() {
         val bitmap = Bitmap.createBitmap(3000, 2000, Bitmap.Config.ARGB_8888)
         val report = RavensightReport.fromBitmap("Captured", bitmap)
-        assertNull(report.refusal(now / 1000)); assertTrue(report.imageBytes()!!.size <= RavensightReport.MAX_IMAGE_BYTES)
+        // The helper stamps the wall clock, so read it right after the report
+        // is built: the test's own `now`, taken when the test instance was
+        // made, can be more than the 60 second allowance behind on a slow
+        // Robolectric start.
+        val capturedNow = System.currentTimeMillis() / 1000
+        assertNull(report.refusal(capturedNow)); assertTrue(report.imageBytes()!!.size <= RavensightReport.MAX_IMAGE_BYTES)
         bitmap.recycle(); val invalid = RavensightReport.fromBitmap("Recycled", bitmap)
-        assertEquals("invalid_image", invalid.refusal(now / 1000))
+        assertEquals("invalid_image", invalid.refusal(System.currentTimeMillis() / 1000))
     }
 }
