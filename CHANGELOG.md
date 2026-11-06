@@ -40,6 +40,9 @@ device field contracts.
   capture never evicts a gameplay event.
 - An error's `rs_trail` is never written to the queue file; a capture
   restored from it is sent without its trail.
+- A leftover temporary queue file is deleted on load, a failed write, an
+  empty queue, opt-out and id reset. The folder stays excluded from Auto
+  Backup by the shipped rules.
 - Backoff jitter is a factor in [0.5, 1) (was plus or minus 20 percent);
   `flush()` cuts a backoff short but never a `Retry-After` wait.
 - The 8 KB event check counts an error event's message, stack and trail

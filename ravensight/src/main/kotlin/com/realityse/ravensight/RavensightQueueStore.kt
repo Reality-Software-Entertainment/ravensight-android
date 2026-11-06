@@ -19,6 +19,9 @@ import org.json.JSONObject
  */
 internal class RavensightQueueStore(val file: File) {
 
+    /** The one temporary file an atomic write goes through, beside [file]. */
+    val tempFile: File get() = File(file.parentFile, file.name + ".tmp")
+
     class Loaded(val events: List<RavensightEvent>, val dropped: Int)
 
     /**
@@ -27,6 +30,8 @@ internal class RavensightQueueStore(val file: File) {
      * [cap], are dropped and counted.
      */
     fun load(nowMs: Long, cap: Int): Loaded {
+        // A write a crash cut short leaves its temporary file behind.
+        tempFile.delete()
         val root = try {
             if (!file.exists()) return Loaded(emptyList(), 0)
             JSONObject(file.readText(Charsets.UTF_8))
@@ -105,7 +110,7 @@ internal class RavensightQueueStore(val file: File) {
             }
             val text = JSONObject().put("version", 2).put("groups", groups).toString()
             file.parentFile?.mkdirs()
-            val temp = File(file.parentFile, file.name + ".tmp")
+            val temp = tempFile
             temp.writeText(text, Charsets.UTF_8)
             if (!temp.renameTo(file)) {
                 temp.delete()
@@ -115,12 +120,15 @@ internal class RavensightQueueStore(val file: File) {
             }
         }
     } catch (_: Exception) {
+        tempFile.delete()
         false
     }
 
+    /** Deletes the queue file and any temporary file beside it. */
     fun delete(): Boolean {
         file.delete()
-        return !file.exists()
+        tempFile.delete()
+        return !file.exists() && !tempFile.exists()
     }
 
     companion object {

@@ -337,6 +337,48 @@ class RavensightWaveTest {
         assertFalse("an opt-out deletes it", queueFile().exists())
     }
 
+    @Test
+    fun `a leftover temporary file is removed on load, every delete path and a failed write`() {
+        val store = RavensightQueueStore(File(File(app.filesDir, "ravensight"), "queue-temp.json"))
+        fun plant() { store.file.parentFile!!.mkdirs(); store.tempFile.writeText("partial") }
+        val one = listOf(com.realityse.ravensight.core.RavensightEvent("a", emptyMap(), now))
+        plant()
+        store.load(now, 500)
+        assertFalse("load sweeps it", store.tempFile.exists())
+        assertTrue(store.save(one))
+        assertFalse("a write leaves none", store.tempFile.exists())
+        plant()
+        assertTrue(store.save(emptyList()))
+        assertFalse("an empty queue deletes the file and its temp", store.file.exists() || store.tempFile.exists())
+        // A rename that fails (a non-empty directory where the file goes).
+        store.file.mkdirs()
+        File(store.file, "keep").writeText("x")
+        assertFalse(store.save(one))
+        assertFalse("a failed rename deletes the temp file", store.tempFile.exists())
+        File(store.file, "keep").delete()
+        store.file.delete()
+    }
+
+    @Test
+    fun `opt-out and a reset remove a leftover temporary file`() {
+        http = transport()
+        launch()
+        val temp = File(queueFile().parentFile, queueFile().name + ".tmp")
+        temp.parentFile!!.mkdirs()
+        temp.writeText("partial")
+        Ravensight.resetDeviceId()
+        worker.runDue()
+        Ravensight.track("a")
+        worker.runDue()
+        Ravensight.resetDeviceId()
+        worker.runDue()
+        assertFalse("a reset sweeps it", temp.exists())
+        temp.writeText("partial")
+        Ravensight.setTrackingEnabled(app, false)
+        worker.runDue()
+        assertFalse("an opt-out sweeps it", temp.exists())
+    }
+
     // --- Exposure -------------------------------------------------------------------
 
     @Test
