@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -18,7 +19,11 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
+import com.realityse.ravensight.core.AutoError
 import com.realityse.ravensight.core.BatchOutcome
+import com.realityse.ravensight.core.ErrorCaptureState
+import com.realityse.ravensight.core.ExitReasons
+import com.realityse.ravensight.core.ExitRecord
 import com.realityse.ravensight.core.RavensightAction
 import com.realityse.ravensight.core.RavensightCore
 import com.realityse.ravensight.core.RavensightCoreConfig
@@ -27,6 +32,7 @@ import com.realityse.ravensight.core.RavensightEventIds
 import com.realityse.ravensight.core.RavensightLimits
 import com.realityse.ravensight.core.RavensightReason
 import com.realityse.ravensight.core.SessionOutcome
+import com.realityse.ravensight.core.TrailRing
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -59,6 +65,8 @@ object Ravensight {
     internal const val KEY_MARKER_TOKEN = "exit_marker_token"
     internal const val KEY_MARKER_EXPIRES_AT = "exit_marker_expires_at_ms"
     internal const val KEY_MARKER_BACKGROUNDED_AT = "exit_marker_backgrounded_at_ms"
+    /** The newest platform exit record already looked at (ApplicationExitInfo timestamp). */
+    internal const val KEY_EXIT_SEEN_AT = "error_exit_seen_at_ms"
 
     internal const val EXTRA_PLAYTEST_TOKEN = "ravensight_playtest_token"
     internal const val EXTRA_PLAYTEST_RUN_ID = "ravensight_playtest_run_id"
@@ -270,6 +278,17 @@ object Ravensight {
         extra: Map<String, Any?>? = null,
         eventName: String = "error",
     ): Boolean = track(eventName, TypedEvents.error(severity, message, stack, extra))
+
+    /**
+     * Adds one line to the error trail: the last 20 lines (SDK events and
+     * these calls) that ride along with the next automatic error report.
+     * Kept in memory only while the game's trail switch is on, scrubbed and
+     * cut to 120 characters, and never sent on its own. [level] is free
+     * text such as "info" or "warn". Never throws. The SDK cannot read your
+     * app's own log output, so this call is the way to add context.
+     */
+    @JvmStatic
+    fun log(level: String, message: String) = safely("log") { controller?.log(level, message) }
 
     /** Refresh public config, with readiness delivered to the listener. */
     @JvmStatic
@@ -573,6 +592,16 @@ object Ravensight {
             null
         }
 
+        // Automatic error capture. errorState is the worker's; the mirrors
+        // below are read by the crash handler on the crashing thread.
+        private val errorState = ErrorCaptureState { clock() }
+        private val trail = TrailRing()
+        private val crashStore: CrashStore by lazy { CrashStore(app) }
+        @Volatile private var crashArmed = false
+        @Volatile private var trailOn = false
+        @Volatile private var sessionStartMs: Long = clock()
+        private val crashSink: (Thread, Throwable) -> Unit = { thread, error -> recordCrash(thread, error) }
+
         private val pumpRunnable = Runnable { runSafely("pump") { pump() } }
         private val tickRunnable = Runnable {
             runSafely("flush timer") {
@@ -661,6 +690,7 @@ object Ravensight {
                 emit { it.onFlushFailed("event_too_large") }
                 return false
             }
+            if (trailOn) trail.add(clock() - sessionStartMs, "track", eventName)
             post("track") {
                 core.track(eventName, snapshot, at)
                 if (core.queueSize >= RavensightCoreConfig.MAX_BATCH_SIZE) pump()
@@ -691,6 +721,7 @@ object Ravensight {
             post("setTrackingEnabled") {
                 // With opt-in, the first yes is the first moment an id may exist.
                 if (!value && foregrounded) resolveDeviceId()
+                if (value) forgetCaptures()
                 applyEnabled()
                 if (value) emit { it.onTrackingDisabled("player") }
             }
@@ -710,6 +741,7 @@ object Ravensight {
                     core.clearQueue()
                     core.invalidateSession()
                     deleteMarker()
+                    forgetCaptures()
                 }
                 return ""
             }
@@ -720,6 +752,7 @@ object Ravensight {
                 core.clearQueue()
                 core.invalidateSession()
                 deleteMarker()
+                forgetCaptures()
             }
             return id
         }
@@ -897,6 +930,7 @@ object Ravensight {
             }
             resolveDeviceId()
             reportExitFromLastLaunch(now)
+            collectEarlierCrashes(now)
             foregrounded = true
             queueGameStarted(now)
             if (core.isActive) scheduleTick()
@@ -946,6 +980,9 @@ object Ravensight {
             exitedQueued = false
             healthSent = false
             frameSampler.clear()
+            errorState.newSession()
+            trail.clear()
+            sessionStartMs = clock()
         }
 
         private fun queueGameStarted(now: Long) {
@@ -1111,6 +1148,7 @@ object Ravensight {
             val errorCode = result.errorCode("")
             val refusal = RavensightReason.forRefusal(result.status, errorCode)
             core.onSettingsResult(result.status, value, errorCode, result.retryAfterSec)
+            if (result.status == 200 && core.trackingEnabled) readErrorCapture(result.json)
             when {
                 refusal != null -> handleRefusal(refusal)
                 !core.trackingEnabled -> handleRefusal(RavensightReason.TRACKING_DISABLED)
@@ -1189,6 +1227,7 @@ object Ravensight {
             when (outcome) {
                 is SessionOutcome.Ready -> {
                     verbose("session ready")
+                    readErrorCapture(json)
                     if (!inForeground) backgroundedAtMs?.let { writeMarker(it) }
                     if (foregrounded && core.isActive) scheduleTick()
                     emit { it.onSessionReady() }
@@ -1352,6 +1391,99 @@ object Ravensight {
             emit { it.onSuggestionsReceived(suggestions) }
         }
 
+        // --- Automatic error capture ---------------------------------------------
+
+        /**
+         * Key, consent, this build's [RavensightConfig.captureErrors], an
+         * active SDK, and the game's switch not known to be off. Before the
+         * switch is known captures are held (see [ErrorCaptureState]).
+         */
+        private fun captureWanted(): Boolean =
+            !inert && config.captureErrors && effectiveEnabled() && serverAllows &&
+                !(errorState.answered && !errorState.enabled)
+
+        /** Installs the crash hook the first time capture is wanted; arms or disarms it after. */
+        private fun syncErrorCapture() {
+            val want = captureWanted()
+            if (want && deps.installCrashHandler) {
+                CrashHandler.install()
+                CrashHandler.sink = crashSink
+            }
+            crashArmed = want
+            trailOn = want && errorState.answered && errorState.trail
+            if (!want) errorState.discardHeld()
+            if (!trailOn) trail.clear()
+        }
+
+        /**
+         * The crashing thread: write the crash to app-private storage,
+         * synchronously, for the next launch. The SDK's own worker thread is
+         * never captured. The handler then calls the previous one.
+         */
+        private fun recordCrash(thread: Thread, error: Throwable) {
+            if (!crashArmed) return
+            if (workerLazy.isInitialized() && (worker as? HandlerWorker)?.thread === thread) return
+            val text = if (trailOn) trail.text() else null
+            crashStore.write(AutoError.crash(error, clock(), text))
+        }
+
+        /**
+         * The first foreground of a launch: crashes the last process wrote,
+         * then, on API 30 and later, native crashes and ANRs the platform
+         * recorded since the last look. Without capture they are deleted
+         * unsent and the exit baseline is forgotten.
+         */
+        private fun collectEarlierCrashes(now: Long) {
+            if (inert) return
+            val stored = crashStore.takeAll()
+            if (!captureWanted()) {
+                prefs.edit().remove(KEY_EXIT_SEEN_AT).apply()
+                return
+            }
+            stored.forEach(::offerCapture)
+            if (Build.VERSION.SDK_INT < 30) return
+            val records: List<ExitRecord> = try {
+                deps.exitReasons(app)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            val lastSeen = if (prefs.contains(KEY_EXIT_SEEN_AT)) prefs.getLong(KEY_EXIT_SEEN_AT, 0L) else null
+            val selection = ExitReasons.select(records, lastSeen, now)
+            prefs.edit().putLong(KEY_EXIT_SEEN_AT, selection.lastSeenMs).apply()
+            selection.toReport.forEach(::offerCapture)
+        }
+
+        private fun offerCapture(error: AutoError) {
+            if (!captureWanted()) return
+            errorState.offer(error)?.let { queueCapture(error, it) }
+        }
+
+        private fun queueCapture(error: AutoError, data: Map<String, Any?>) {
+            core.track("error", stamp(data), error.atMs / 1000L, auto = true)
+        }
+
+        /** Reads `errorCapture: { enabled, trail }` from a settings or session answer. */
+        private fun readErrorCapture(json: JSONObject?) {
+            val answer = json?.optJSONObject("errorCapture")
+            val enabled = answer?.let { it.opt("enabled") != false }
+            val trailSwitch = answer?.let { it.opt("trail") == true }
+            val released = errorState.onAnswer(enabled, trailSwitch, answer != null)
+            syncErrorCapture()
+            if (captureWanted()) released.forEach { (error, data) -> queueCapture(error, data) }
+        }
+
+        /** Opt-out or a new identity: nothing captured earlier may be sent. */
+        private fun forgetCaptures() {
+            crashStore.clear()
+            prefs.edit().remove(KEY_EXIT_SEEN_AT).apply()
+            errorState.discardHeld()
+            trail.clear()
+        }
+
+        fun log(level: String, message: String) {
+            if (trailOn) trail.add(clock() - sessionStartMs, level, message)
+        }
+
         // --- Helpers ------------------------------------------------------------
 
         private fun scheduleTick() {
@@ -1388,6 +1520,7 @@ object Ravensight {
         private fun publish() {
             serverAllows = core.trackingEnabled && core.stopReason == null
             active = serverAllows && effectiveEnabled()
+            syncErrorCapture()
             ready = core.isSessionValid()
             sessionToken = core.sessionToken
             val reason = core.reason
@@ -1442,6 +1575,7 @@ object Ravensight {
         }
 
         internal fun shutdownForTest() {
+            if (CrashHandler.sink === crashSink) CrashHandler.sink = null
             uiForeground = false
             applyFrameSampling()
             (app as? Application)?.unregisterActivityLifecycleCallbacks(this)
@@ -1467,7 +1601,7 @@ internal interface RavensightWorker {
 }
 
 internal class HandlerWorker : RavensightWorker {
-    private val thread = HandlerThread("Ravensight").apply { start() }
+    val thread = HandlerThread("Ravensight").apply { start() }
     private val handler = Handler(thread.looper)
     override fun post(r: Runnable) {
         handler.post(r)
@@ -1506,6 +1640,10 @@ internal class RavensightDeps(
     },
     /** Milliseconds from process start to the SDK's start. */
     val bootMs: () -> Long? = { SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime() },
+    /** How earlier processes ended (ApplicationExitInfo, API 30 and later). */
+    val exitReasons: (Context) -> List<ExitRecord> = { SystemExitReasons.read(it) },
+    /** Set the process-wide uncaught exception handler. Tests that drive the hook by hand turn it off. */
+    val installCrashHandler: Boolean = true,
 )
 
 /** Where frame callbacks are scheduled. The Choreographer in production. */

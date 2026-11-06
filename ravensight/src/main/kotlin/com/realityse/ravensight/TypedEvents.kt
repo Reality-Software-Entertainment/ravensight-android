@@ -21,7 +21,7 @@ internal object TypedEvents {
         "rs_amount", "rs_currency", "rs_item_type", "rs_item_id", "rs_cart", "rs_transaction_id",
         "rs_flow", "rs_resource",
         "rs_status", "rs_p1", "rs_p2", "rs_p3", "rs_score",
-        "rs_severity", "rs_message", "rs_stack",
+        "rs_severity", "rs_message", "rs_stack", "rs_source", "rs_error_type", "rs_trail",
         "rs_fps_median", "rs_fps_p10", "rs_memory_mb", "rs_boot_ms",
     )
 

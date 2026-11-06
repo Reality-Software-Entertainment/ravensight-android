@@ -101,6 +101,16 @@ class RavensightConfig @JvmOverloads constructor(
      * milliseconds. Nothing is sent if no sample was taken. Off by default.
      */
     val performance: Boolean = false,
+    /**
+     * Automatic error capture, on by default. With a key and the player's
+     * consent the SDK records an uncaught exception (the app still crashes
+     * exactly as before) and sends it on the next launch, and on Android 11
+     * (API 30) and later reports native crashes and ANRs from the platform's
+     * exit records. Nothing is captured while the game's Error capture
+     * switch in the dashboard is off. False turns all of it off for this
+     * build; [Ravensight.trackError] keeps working either way.
+     */
+    val captureErrors: Boolean = true,
 ) {
     companion object {
         /** The bare host; "/api/v1" is appended by [normalizeApiUrl]. */

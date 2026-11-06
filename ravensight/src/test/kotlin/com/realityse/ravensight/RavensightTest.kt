@@ -1062,13 +1062,14 @@ class RavensightTest {
     }
 
     @Test
-    fun `a key-only caller saves only the device id, as before`() {
+    fun `a key-only caller saves only the device id and the exit record baseline`() {
         init()
         foreground()
         Ravensight.track("e")
         Ravensight.flush()
         worker.runDue()
-        assertEquals(setOf(Ravensight.KEY_DEVICE_ID), prefs().all.keys)
+        // The baseline is a timestamp (API 30 and later), so an exit is reported once.
+        assertEquals(setOf(Ravensight.KEY_DEVICE_ID, Ravensight.KEY_EXIT_SEEN_AT), prefs().all.keys)
         assertFalse(sessionBody()!!.has("distribution"))
     }
 
