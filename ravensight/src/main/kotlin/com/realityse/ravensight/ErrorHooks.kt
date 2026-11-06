@@ -1,9 +1,11 @@
 package com.realityse.ravensight
 
 import android.app.ActivityManager
+import android.app.Application
 import android.app.ApplicationExitInfo
 import android.content.Context
 import android.os.Build
+import android.os.StrictMode
 import com.realityse.ravensight.core.AutoError
 import com.realityse.ravensight.core.ExitRecord
 import java.io.File
@@ -63,15 +65,48 @@ internal object CrashHandler {
     }
 }
 
+/** This process's name: Application.getProcessName() on API 28+, else /proc/self/cmdline, else the package. */
+internal fun currentProcessName(context: Context): String {
+    val name = try {
+        if (Build.VERSION.SDK_INT >= 28) Application.getProcessName() else null
+    } catch (_: Throwable) {
+        null
+    } ?: try {
+        File("/proc/self/cmdline").readBytes().takeWhile { it != 0.toByte() }.toByteArray().toString(Charsets.UTF_8)
+    } catch (_: Throwable) {
+        null
+    }
+    return name?.trim()?.takeIf { it.isNotEmpty() } ?: context.packageName
+}
+
 /**
  * Crashes written synchronously by the dying process and read once by the
- * next launch. App-private, in noBackupFilesDir (never backed up or
- * transferred), at most [MAX_FILES] at a time, deleted when read.
+ * next launch of the same process. App-private, in noBackupFilesDir (never
+ * backed up or transferred), one directory per process name so a service
+ * process's crash is never sent as the game's, at most [MAX_FILES] at a
+ * time, deleted when read.
  */
-internal class CrashStore(context: Context) {
-    private val dir = File(context.noBackupFilesDir ?: context.filesDir, "ravensight_crashes")
+internal class CrashStore(context: Context, processName: String = currentProcessName(context)) {
+    private val dir = File(
+        File(context.noBackupFilesDir ?: context.filesDir, "ravensight_crashes"),
+        processName.replace(Regex("[^A-Za-z0-9._-]"), "_"),
+    )
 
+    /**
+     * Called on the crashing thread. Disk access is allowed for the write,
+     * so a debug build with a StrictMode penaltyDeath policy still records
+     * the crash; the thread's policy is restored after.
+     */
     fun write(error: AutoError) {
+        val policy = StrictMode.allowThreadDiskWrites()
+        try {
+            writeFile(error)
+        } finally {
+            StrictMode.setThreadPolicy(policy)
+        }
+    }
+
+    private fun writeFile(error: AutoError) {
         if (!dir.isDirectory && !dir.mkdirs()) return
         if ((dir.list()?.size ?: 0) >= MAX_FILES) return
         val json = JSONObject()
@@ -132,15 +167,16 @@ internal class CrashStore(context: Context) {
  * tombstone or a trace.
  */
 internal object SystemExitReasons {
-    fun read(context: Context): List<ExitRecord> {
+    /** Exits of this process only ([processName]), so a service process's exit is never the game's. */
+    fun read(context: Context, processName: String = currentProcessName(context)): List<ExitRecord> {
         if (Build.VERSION.SDK_INT < 30) return emptyList()
-        return readApi30(context)
+        return readApi30(context, processName)
     }
 
     @androidx.annotation.RequiresApi(30)
-    private fun readApi30(context: Context): List<ExitRecord> {
+    private fun readApi30(context: Context, processName: String): List<ExitRecord> {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return emptyList()
         val infos: List<ApplicationExitInfo> = am.getHistoricalProcessExitReasons(context.packageName, 0, 0)
-        return infos.map { ExitRecord(it.timestamp, it.reason, it.description) }
+        return infos.filter { it.processName == processName }.map { ExitRecord(it.timestamp, it.reason, it.description) }
     }
 }

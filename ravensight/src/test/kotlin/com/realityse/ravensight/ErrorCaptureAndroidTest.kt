@@ -65,6 +65,8 @@ class ErrorCaptureAndroidTest {
 
     private fun crashDir() = File(app.noBackupFilesDir, "ravensight_crashes")
 
+    private fun crashFiles() = crashDir().walk().count { it.isFile }
+
     private fun init(
         captureErrors: Boolean = true,
         key: String = "gt_live_test",
@@ -147,7 +149,7 @@ class ErrorCaptureAndroidTest {
     fun `a crash is written synchronously and sent on the next launch as one critical crash event`() {
         init()
         crash(IllegalStateException("save failed for bob@example.com"))
-        assertEquals(1, crashDir().list()!!.size)
+        assertEquals(1, crashFiles())
         relaunch()
         init()
         foreground()
@@ -163,7 +165,7 @@ class ErrorCaptureAndroidTest {
         assertFalse(data.has("rs_trail"))
         assertFalse(data.has("rs_fp"))
         assertEquals((now - 60_000) / 1000, events[0].getLong("timestamp"))
-        assertEquals(0, crashDir().list()!!.size)
+        assertEquals(0, crashFiles())
         // Gameplay first: game_started opens the batch, the error follows.
         val first = JSONObject(http.requests.first { it.path == "/track/batch" }.body!!).getJSONArray("events")
         assertEquals("game_started", first.getJSONObject(0).getString("event"))
@@ -178,10 +180,10 @@ class ErrorCaptureAndroidTest {
         init()
         foreground()
         assertTrue(errorEvents().isEmpty())
-        assertEquals(0, crashDir().list()!!.size)
+        assertEquals(0, crashFiles())
         // And nothing new is recorded while it is off.
         crash(RuntimeException("y"))
-        assertEquals(0, crashDir().list()!!.size)
+        assertEquals(0, crashFiles())
     }
 
     @Test
@@ -204,7 +206,7 @@ class ErrorCaptureAndroidTest {
         crash(RuntimeException("y"))
         foreground()
         assertTrue(errorEvents().isEmpty())
-        assertEquals(0, crashDir().list()!!.size)
+        assertEquals(0, crashFiles())
     }
 
     @Test
@@ -213,9 +215,9 @@ class ErrorCaptureAndroidTest {
         crash(RuntimeException("x"))
         Ravensight.setTrackingEnabled(app, false)
         worker.runDue()
-        assertEquals(0, crashDir().list()!!.size)
+        assertEquals(0, crashFiles())
         crash(RuntimeException("y"))
-        assertEquals(0, crashDir().list()!!.size)
+        assertEquals(0, crashFiles())
     }
 
     @Test
@@ -292,15 +294,43 @@ class ErrorCaptureAndroidTest {
 
     @Test
     @Config(sdk = [30])
-    fun `the platform exit records are read on API 30`() {
+    fun `the platform exit records are read on API 30, for this process only`() {
         val am = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         shadowOf(am).addApplicationExitInfo(
-            ApplicationExitInfoBuilder.newBuilder().setTimestamp(now).setReason(ApplicationExitInfo.REASON_ANR).setDescription("anr").build(),
+            ApplicationExitInfoBuilder.newBuilder().setTimestamp(now).setReason(ApplicationExitInfo.REASON_ANR)
+                .setDescription("anr").setProcessName("com.example.game").build(),
         )
-        val read = SystemExitReasons.read(app)
+        shadowOf(am).addApplicationExitInfo(
+            ApplicationExitInfoBuilder.newBuilder().setTimestamp(now + 1).setReason(ApplicationExitInfo.REASON_CRASH_NATIVE)
+                .setDescription("service").setProcessName("com.example.game:sync").build(),
+        )
+        val read = SystemExitReasons.read(app, "com.example.game")
         assertEquals(1, read.size)
         assertEquals(ExitReasons.REASON_ANR, read[0].reason)
         assertEquals("anr", read[0].description)
+    }
+
+    @Test
+    fun `stored crashes belong to the process that wrote them`() {
+        val service = CrashStore(app, "com.example.game:sync")
+        val game = CrashStore(app, "com.example.game")
+        service.write(com.realityse.ravensight.core.AutoError.crash(RuntimeException("service"), now))
+        assertTrue(game.takeAll().isEmpty())
+        assertEquals("service", service.takeAll().single().message)
+    }
+
+    @Test
+    fun `the crash write is allowed under a penaltyDeath policy and the policy is restored`() {
+        val strict = android.os.StrictMode.ThreadPolicy.Builder().detectDiskWrites().detectDiskReads().penaltyDeath().build()
+        val old = android.os.StrictMode.getThreadPolicy()
+        android.os.StrictMode.setThreadPolicy(strict)
+        try {
+            CrashStore(app, "p").write(com.realityse.ravensight.core.AutoError.crash(RuntimeException("x"), now))
+            assertEquals(strict.toString(), android.os.StrictMode.getThreadPolicy().toString())
+        } finally {
+            android.os.StrictMode.setThreadPolicy(old)
+        }
+        assertEquals(1, crashFiles())
     }
 
     @Test
