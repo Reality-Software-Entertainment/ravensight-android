@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## [0.5.0] - 2026-11-06
 
 Implements the Ravensight delivery, ads and attribution, exposure and
-device field contracts.
+device field contracts. Needs a Ravensight server that accepts origins, signatures, gzip bodies,
+`rs_exposure` and the `rs_ad_*` and `rs_attr_*` keys; the hosted service at
+ravensight.io runs one.
 
 ### Added
 
