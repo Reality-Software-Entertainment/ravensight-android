@@ -44,7 +44,7 @@ Then add the dependency (`app/build.gradle.kts`):
 
 ```kotlin
 dependencies {
-    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.4.0")
+    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.5.0")
 }
 ```
 
@@ -171,6 +171,8 @@ callbacks are delivered on the main thread.
 | `playtestRunId` | null | Ravensight Playtest run id, paired with the token. |
 | `optional` | off | Silences the one warning a blank `ingestKey` logs. |
 | `consent` | `OPT_OUT` | `RavensightConsent.OPT_IN` saves nothing, creates no device id and sends nothing until `setTrackingEnabled(context, true)`. See "Public builds". |
+| `persistQueue` | on | Keeps unsent events in a file, so they are sent on the next launch (see "How delivery works"). |
+| `sendDeviceInfo` | on | Sends `Build.MODEL` and `Build.VERSION.RELEASE` on the session (see "Device id, privacy and Auto Backup"). |
 | `distribution` | null | A short label for where this build was distributed, such as `"play-store"`, sent when a session opens. At most 40 characters, no control characters; anything else is ignored with one warning. |
 | `captureErrors` | on | Automatic error capture: crashes, and on API 30 and later native crashes and ANRs. See "Automatic error capture". `trackError` works either way. |
 
@@ -360,7 +362,7 @@ is called whenever it changes.
 | `disabled` | `enabled = false`, `setEnabled(false)`, the player's saved opt-out, or, with `consent = OPT_IN`, no yes yet. | Nothing touches the network. |
 | `invalid_key` | A `401`, or a `403` other than the ones below. | Logs one warning, `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ or gt_pub_ key.` On the settings check or a session open the run ends: the queue is cleared and nothing is retried, not even by `flush()`. On a batch or another endpoint, automatic sending stops and `flush()` makes one more attempt. |
 | `tracking_disabled` | The kill switch is on for your game (`GET /settings` or a `403 tracking_disabled`). | Clears the queue and sends nothing more this run. `onTrackingDisabled("server")`. |
-| `offline` | The network was unreachable or timed out, or a batch answered `5xx`. | Keeps events and retries after 10 seconds, doubling to 5 minutes, each wait varied by plus or minus 20 percent. |
+| `offline` | The network was unreachable or timed out, or a batch answered `5xx`. | Keeps events and retries after 10 seconds, doubling to 5 minutes, each wait multiplied by a random factor in [0.5, 1). |
 | `rate_limited` | `429`, or `503` with `Retry-After`, from the settings check, the session or a batch. | Waits exactly `Retry-After`, then retries. |
 | `session_failed` | Opening a session failed another way, or a playtest token was refused or arrived without a run id. | Retries with backoff; a playtest refusal stops the run. |
 | `playtest_job_closed` | The playtest job this run belongs to has closed. | Clears the queue and sends nothing more this run. |
@@ -436,36 +438,66 @@ What 0.3.0 adds to every build, public or not:
   once per launch, and a counter, for example
   `dev_3f9c0a1b2c3d-6720f1a0-9b1e44c2-12`. It always matches
   `^[A-Za-z0-9_-]{1,64}$`, is written into the event when it is tracked,
-  and a resend after a failure carries the same ids. The queue lives in
-  memory, so there is no saved queue for it to survive. A value of your
-  own under that key is replaced.
+  and a resend after a failure, or from the queue file on a later launch,
+  carries the same ids. A value of your own under that key is replaced.
 * **An 8 KB event cap.** An event whose data is larger than 8,192 bytes as
-  JSON is dropped when tracked, never sent: `track` returns false, one
+  JSON (an error event's message, stack and trail counted one byte a
+  character, as the server counts) is dropped when tracked, never sent: `track` returns false, one
   warning is logged for the run and `onFlushFailed("event_too_large")` is
   called for each.
 * **A refused key ends the run** (see `invalid_key` under "Status and
   failures").
-* **Retry jitter.** A retry wait without a `Retry-After` varies by plus or
-  minus 20 percent; a `Retry-After` is still obeyed exactly.
+* **Retry jitter.** A retry wait without a `Retry-After` is multiplied by a
+  random factor in [0.5, 1); a `Retry-After` is still obeyed exactly.
 
 ## How delivery works
+
+The SDK follows the Ravensight delivery contract, so an event survives a
+lost connection, a crash, a kill and a build update.
 
 * **Batching.** Up to 50 events per request, the server hard limit. A flush
   keeps sending batches until the queue drains. A request goes out on the 5
   second timer, as soon as 50 events are waiting, on `flush()` and when the
   app goes to the background, never one per `track()`.
-* **Queue.** Events wait in memory, up to `maxQueueSize` (500 by default).
-  Past that the oldest are dropped so the newest are kept.
-* **Failures.** A failed request keeps its events queued for the next
-  attempt. The queue lives in memory, so anything not delivered when the
-  process dies is gone.
-* **Session expiry.** A batch `401` clears the session, opens a new one and
-  re sends the same batch, at most twice in a row before backing off.
-* **Oversize batches.** A `400` or `413` halves the batch and retries down to a single
-  event. An event still rejected on its own is dropped and counted, so it
-  cannot block everything behind it.
-* **Timestamps.** Each event carries the Unix time, in seconds, at which it
-  was tracked.
+* **Queue.** Up to `maxQueueSize` (500 by default). Past that the oldest are
+  dropped so the newest are kept, except that the oldest automatic error
+  capture always goes first, and a capture never pushes out a gameplay
+  event (with no capture queued, an incoming capture is dropped). Gameplay
+  events, your own `trackError` included, queue ahead of automatic
+  captures.
+* **Persisted queue.** On by default (`persistQueue`). Unsent events are
+  kept in `ravensight/queue-<16 hex>.json` in the app's private files
+  directory (64-bit FNV-1a of the ingest key), queue format version 2,
+  written atomically within about a second of a change, right after every
+  answer, and on every background; deleted when the queue is empty, the
+  player opts out or the device id is reset. The next launch reads it and
+  sends what is left. Events older than 89 days are dropped when it is
+  read. Never used during a playtest run. Excluded from Auto Backup by the
+  shipped rules. An error's trail is never written to it.
+* **Original session, build and platform.** Each event carries its own
+  timestamp in milliseconds, set when it was tracked, and the `origin` the
+  session answer gave (an opaque signed stamp of that session, build and
+  platform). An event sent under a later session carries that origin, so
+  the server files it under the run it happened in. The stamp is kept only
+  in the queue file, never logged or sent anywhere else.
+* **Answers.** An event leaves the queue on a `2xx`, or when it is refused:
+  a `400` with an `index` drops that event; `400 batch_too_large` and `413`
+  halve the batch, down to one event, which is then dropped; any other `400`
+  drops the request's events. A `401` (including `signature_required`,
+  `signature_invalid` and `signature_expired`) opens a new session once and
+  resends with the same ids; a second `401` in a row waits for the backoff.
+  A `403` on a batch stops sending and keeps the events, on disk, for the
+  next launch. A `415` on a compressed body resends uncompressed. A `429`,
+  or `503` with `Retry-After`, waits exactly `Retry-After`; `flush()` never
+  cuts it short, though it does cut an ordinary backoff short.
+* **Compression.** A batch body of 1,024 bytes or more is sent gzip
+  compressed (`Content-Encoding: gzip`).
+* **Signed requests.** When the session answer carries `signing` (public
+  `gt_pub_` keys), every batch is signed: `X-Ravensight-Timestamp` and
+  `X-Ravensight-Signature: v1=<HMAC-SHA256>` over the uncompressed body,
+  with the device clock corrected by the server's time. The secret is kept
+  in memory only. Signing proves the request came from code holding that
+  session's secret; it does not prove the build is unmodified.
 
 ## Opt-out and reset
 
@@ -519,7 +551,17 @@ created, and stores it in `SharedPreferences` under `ravensight/device_id`.
 An existing id is never rewritten. With `consent = OPT_IN` it is created at
 the player's first yes, not before, and without a key it is never created. No hardware identifier, advertising id,
 IP based fingerprint or personal data is collected by the SDK itself. Only
-the events you choose to send leave the device.
+the events you choose to send leave the device, plus two device fields on
+the session (turn them off with `sendDeviceInfo = false`):
+
+| Field | What | Source |
+| --- | --- | --- |
+| `device.model` | the model name, such as `Pixel 7`, never a serial; a Meta Quest headset (Horizon OS) is sent as `Meta Quest 3` | `Build.MODEL`, prefixed with `Meta` when `Build.MANUFACTURER` is `Oculus` or `Meta` |
+| `device.osVersion` | the Android version only, such as `14` | `Build.VERSION.RELEASE` |
+
+No GPU name is sent. Country is never sent by the SDK. Each value is
+trimmed, kept to printable characters and cut to 128 characters. Neither
+needs a permission.
 
 Android's Auto Backup copies `SharedPreferences` to the player's cloud
 backup by default, which would carry the id to a new phone or across a
@@ -538,9 +580,11 @@ If your app already has its own rule files, add these lines to them instead:
 ```xml
 <!-- in your fullBackupContent file -->
 <exclude domain="sharedpref" path="ravensight.xml" />
+<exclude domain="file" path="ravensight/" />
 
 <!-- in your dataExtractionRules file, inside both <cloud-backup> and <device-transfer> -->
 <exclude domain="sharedpref" path="ravensight.xml" />
+<exclude domain="file" path="ravensight/" />
 ```
 
 A game that sends gameplay events and nothing else can declare Device ID and
@@ -662,9 +706,16 @@ one ordinary event. Keep safe defaults for first launch and offline play.
 
 A single persistent cache is scoped to endpoint, key, device, platform and build.
 Playtests never persist it. Consent/identity changes invalidate late responses.
-Active experiments automatically add `rs_exp_<key>` to newly tracked events,
-including typed helpers. Already queued events retain their original properties.
-Refresh config to pick up stopped experiments. No config access occurs while the
+Exposure: a fetch alone is not an exposure. The first `getConfig` call in a
+run (any key) marks every experiment the last fetch assigned as exposed: one
+`rs_exposure` event is queued then, and every event queued after it carries
+`rs_exp_<key>` = `<variant>`. Events queued before carry no tag, and an event
+stored offline keeps the tag it was queued with. An experiment missing from a
+later fetch is no longer tagged. A well-formed `rs_exp_` value your game sets
+itself is kept; a malformed one is replaced. A run is one launch of the app;
+`resetDeviceId` starts a new one. Do not log or display the device id beside
+config values: anyone holding the build's key and a device id can fetch that
+device's config. No config access occurs while the
 SDK is inactive or before the player's consent.
 
 ## Player Reports (0.3.1)
@@ -710,3 +761,38 @@ The API does not capture the screen or invoke AI automatically.
 Validation uses Robolectric native bitmap encoding/decoding plus stub API and
 storage transports. Real device capture and a live storage upload remain release
 checks; they are not claimed as tested here.
+
+## Ads and attribution
+
+```kotlin
+// An impression with revenue, in micros of the currency: 0.0015 USD.
+Ravensight.trackAdRevenue("admob", "rewarded", "level_end", "1500", "USD")
+
+// From a mediation callback's values; the mediation SDK is never linked here.
+Ravensight.trackAd(RavensightAd.fromAdMob(adValue.valueMicros, adValue.currencyCode, adSourceName, "rewarded", "shop"))
+Ravensight.trackAd(RavensightAd.fromAppLovinMax(ad.revenue, ad.networkName, ad.format.label, ad.placement))
+Ravensight.trackAd(RavensightAd.fromIronSource(data.revenue, data.adNetwork, data.adUnit, data.placement))
+Ravensight.trackAd(RavensightAd.fromTopOn(info.publisherRevenue, info.currency, info.networkName, adType, scenario))
+
+// Clicks, rewards and failures carry no revenue.
+Ravensight.trackAd(RavensightAd("admob", "rewarded", "rewarded", placement = "level_end"))
+
+// Where the install came from, once per install.
+Ravensight.setAttribution(RavensightAttribution("store_referrer", campaign = "spring"))
+```
+
+* Revenue is a digit string of micros, never a float. A mediation double is
+  turned into its decimal text and converted with `BigDecimal`, rounding
+  half up (`RavensightAd.microsFromDouble`, `RavensightAd.microsFromDecimalString`).
+* One currency per event, as the mediation SDK reported it. Never converted.
+* Revenue is sent only on `shown`. Revenue without a three letter currency,
+  or on another result, is refused locally and nothing is queued.
+* Mediation format labels map to `banner`, `interstitial`, `rewarded`,
+  `native`, `app_open` or `other` (`RavensightAd.mapFormat`).
+* `setAttribution` sends one `rs_attribution` event per install and saves a
+  flag beside the device id; `resetDeviceId` forgets it. Pass
+  `Ravensight.deviceId` to an attribution partner as its customer user id if
+  you use one.
+
+The server must know the `rs_ad_` and `rs_attr_` keys before a public key
+accepts them: use these helpers only with a server release that has them.

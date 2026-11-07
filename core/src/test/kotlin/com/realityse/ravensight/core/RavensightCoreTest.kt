@@ -13,11 +13,11 @@ import org.junit.Test
 class RavensightCoreTest {
 
     private var now = 1_000_000_000_000L
-    private fun core(config: RavensightCoreConfig = RavensightCoreConfig(random = { 0.5 })) =
+    private fun core(config: RavensightCoreConfig = RavensightCoreConfig(random = { 1.0 })) =
         RavensightCore(config) { now }
 
     /** Walks a fresh core through settings ok + session ok. */
-    private fun booted(config: RavensightCoreConfig = RavensightCoreConfig(random = { 0.5 })): RavensightCore {
+    private fun booted(config: RavensightCoreConfig = RavensightCoreConfig(random = { 1.0 })): RavensightCore {
         val c = core(config)
         assertTrue(c.nextAction() is RavensightAction.CheckSettings)
         c.onSettingsResult(200, true)
@@ -191,7 +191,7 @@ class RavensightCoreTest {
 
     @Test
     fun `custom queue cap is respected`() {
-        val c = core(RavensightCoreConfig(random = { 0.5 }, maxQueueSize = 3))
+        val c = core(RavensightCoreConfig(random = { 1.0 }, maxQueueSize = 3))
         c.onSettingsResult(200, true)
         repeat(5) { c.track("e$it") }
         assertEquals(3, c.queueSize)
@@ -258,34 +258,26 @@ class RavensightCoreTest {
 
     @Test
     fun `a 202 resets the consecutive 401 counter`() {
+        // One reopen per 401 is allowed; a second 401 in a row backs off. A
+        // 202 in between resets the count.
         val c = booted()
         c.track("e")
-        repeat(2) {
-            c.nextAction()
-            var action = c.nextAction()
-            if (action is RavensightAction.OpenSession) {
-                c.onSessionResult(201, "t$it", expiresInSec = 3_600L)
-                c.nextAction()
-            }
-            c.onBatchResult(401)
-        }
-        c.nextAction() // OpenSession
+        if (c.nextAction() is RavensightAction.OpenSession) c.onSessionResult(201, "t0", expiresInSec = 3_600L)
+        assertTrue(c.nextAction() is RavensightAction.SendBatch)
+        c.onBatchResult(401)
+        assertTrue(c.nextAction() is RavensightAction.OpenSession)
         c.onSessionResult(201, "good", expiresInSec = 3_600L)
-        c.nextAction() // SendBatch
+        assertTrue(c.nextAction() is RavensightAction.SendBatch)
         c.onBatchResult(202)
 
-        // Two more 401s should not trip the guard (counter was reset).
         c.track("f")
-        repeat(2) {
-            var action = c.nextAction()
-            if (action is RavensightAction.OpenSession) {
-                c.onSessionResult(201, "u$it", expiresInSec = 3_600L)
-                action = c.nextAction()
-            }
-            assertTrue(action is RavensightAction.SendBatch)
-            c.onBatchResult(401)
-        }
-        assertTrue(c.nextAction() is RavensightAction.OpenSession)
+        assertTrue(c.nextAction() is RavensightAction.SendBatch)
+        c.onBatchResult(401)
+        assertTrue("one 401 after a 202 reopens at once", c.nextAction() is RavensightAction.OpenSession)
+        c.onSessionResult(201, "again", expiresInSec = 3_600L)
+        assertTrue(c.nextAction() is RavensightAction.SendBatch)
+        c.onBatchResult(401)
+        assertTrue("a second 401 in a row backs off", c.nextAction() is RavensightAction.WaitUntil)
     }
 
     // --- Backoff and Retry-After ---------------------------------------------
@@ -374,24 +366,24 @@ class RavensightCoreTest {
 
         var batch = c.nextAction() as RavensightAction.SendBatch
         assertEquals(50, batch.events.size)
-        var outcome = c.onBatchResult(400)
+        var outcome = c.onBatchResult(400, errorCode = "batch_too_large")
         assertEquals(25, (outcome as BatchOutcome.BatchSplit).newLimit)
 
         batch = c.nextAction() as RavensightAction.SendBatch
         assertEquals(25, batch.events.size)
-        outcome = c.onBatchResult(400)
+        outcome = c.onBatchResult(400, errorCode = "batch_too_large")
         assertEquals(12, (outcome as BatchOutcome.BatchSplit).newLimit)
 
         batch = c.nextAction() as RavensightAction.SendBatch
         assertEquals(12, batch.events.size)
-        c.onBatchResult(400) // 6
-        c.nextAction(); c.onBatchResult(400) // 3
-        c.nextAction(); c.onBatchResult(400) // 1
+        c.onBatchResult(400, errorCode = "batch_too_large") // 6
+        c.nextAction(); c.onBatchResult(400, errorCode = "batch_too_large") // 3
+        c.nextAction(); c.onBatchResult(400, errorCode = "batch_too_large") // 1
         batch = c.nextAction() as RavensightAction.SendBatch
         assertEquals(1, batch.events.size)
         assertEquals("e0", batch.events[0].name)
 
-        assertEquals(BatchOutcome.EventRejected, c.onBatchResult(400))
+        assertEquals(1, (c.onBatchResult(400, errorCode = "batch_too_large") as BatchOutcome.EventRejected).count)
         assertEquals(49, c.queueSize) // e0 dropped, everything behind it freed
 
         // Batch limit is restored to 50 after the drop.
@@ -407,7 +399,7 @@ class RavensightCoreTest {
         val c = booted()
         repeat(60) { c.track("e$it") }
         c.nextAction()
-        c.onBatchResult(400) // limit 25
+        c.onBatchResult(413) // limit 25
         c.nextAction()
         c.onBatchResult(202) // 25 accepted, limit back to 50
         val batch = c.nextAction() as RavensightAction.SendBatch
@@ -419,7 +411,7 @@ class RavensightCoreTest {
         val c = booted()
         repeat(2) { c.track("e$it") }
         c.nextAction()
-        c.onBatchResult(400)
+        c.onBatchResult(400, errorCode = "batch_too_large")
         assertTrue(c.nextAction() is RavensightAction.SendBatch)
     }
 
@@ -664,7 +656,7 @@ class RavensightCoreTest {
 
     @Test
     fun `a queue cap below one is clamped to one`() {
-        val c = core(RavensightCoreConfig(random = { 0.5 }, maxQueueSize = 0, maxBatchSize = 0))
+        val c = core(RavensightCoreConfig(random = { 1.0 }, maxQueueSize = 0, maxBatchSize = 0))
         assertTrue(c.track("a"))
         assertTrue(c.track("b"))
         assertEquals(1, c.queueSize)
@@ -723,13 +715,13 @@ class RavensightCoreTest {
     }
 
     @Test
-    fun `backoff jitter stays within twenty percent`() {
-        assertEquals(8_000L, firstBackoffWait(0.0))
-        assertEquals(10_000L, firstBackoffWait(0.5)) // a fixed 0.5 is the old backoff exactly
-        assertEquals(12_000L, firstBackoffWait(0.999_999))
+    fun `backoff jitter is a factor from a half to one`() {
+        assertEquals(5_000L, firstBackoffWait(0.0))
+        assertEquals(7_500L, firstBackoffWait(0.5))
+        assertEquals(10_000L, firstBackoffWait(0.999_999))
         repeat(200) {
             val wait = firstBackoffWait(kotlin.random.Random.nextDouble())
-            assertTrue("wait $wait", wait in 8_000L..12_000L)
+            assertTrue("wait $wait", wait in 5_000L..10_000L)
         }
     }
 
@@ -812,7 +804,7 @@ class RavensightCoreTest {
         assertEquals(2, (c.nextAction() as RavensightAction.SendBatch).events.size)
         assertTrue(c.onBatchResult(413) is BatchOutcome.BatchSplit)
         assertEquals(1, (c.nextAction() as RavensightAction.SendBatch).events.size)
-        assertEquals(BatchOutcome.EventRejected, c.onBatchResult(413))
+        assertEquals(1, (c.onBatchResult(413) as BatchOutcome.EventRejected).count)
         assertEquals(3, c.queueSize)
         assertEquals(0L, c.retryInMs)
     }
@@ -823,8 +815,10 @@ class RavensightCoreTest {
         c.track("a")
         assertTrue(c.track("error", auto = true))
         c.track("b")
-        // Full: an incoming capture is dropped, a gameplay event evicts the capture.
-        assertFalse(c.track("error", auto = true))
+        // Full: an incoming capture evicts the oldest capture (the queue rule
+        // agreed for every SDK); a gameplay event evicts a capture too.
+        assertTrue(c.track("error_2", auto = true))
+        assertEquals(listOf("a", "b", "error_2"), c.snapshot().map { it.name })
         assertTrue(c.track("c"))
         c.onSettingsResult(200, true)
         c.nextAction()

@@ -31,6 +31,7 @@ import com.realityse.ravensight.core.RavensightEvent
 import com.realityse.ravensight.core.RavensightEventIds
 import com.realityse.ravensight.core.RavensightLimits
 import com.realityse.ravensight.core.RavensightReason
+import com.realityse.ravensight.core.RavensightWire
 import com.realityse.ravensight.core.SessionOutcome
 import com.realityse.ravensight.core.TrailRing
 import java.security.SecureRandom
@@ -54,7 +55,7 @@ import org.json.JSONObject
 object Ravensight {
 
     /** This SDK's version. */
-    const val VERSION: String = "0.4.0"
+    const val VERSION: String = "0.5.0"
 
     internal const val TAG = "Ravensight"
     internal const val PREFS = "ravensight"
@@ -67,6 +68,7 @@ object Ravensight {
     internal const val KEY_MARKER_BACKGROUNDED_AT = "exit_marker_backgrounded_at_ms"
     /** The newest platform exit record already looked at (ApplicationExitInfo timestamp). */
     internal const val KEY_EXIT_SEEN_AT = "error_exit_seen_at_ms"
+    internal const val KEY_ATTRIBUTION_SENT = "attribution_sent"
 
     internal const val EXTRA_PLAYTEST_TOKEN = "ravensight_playtest_token"
     internal const val EXTRA_PLAYTEST_RUN_ID = "ravensight_playtest_run_id"
@@ -292,6 +294,37 @@ object Ravensight {
 
     /** Refresh public config, with readiness delivered to the listener. */
     @JvmStatic
+    /**
+     * One ad lifecycle step as an `rs_ad` event (the contract's fixed name).
+     * Refused locally, returning false with nothing queued, when the ad breaks
+     * the contract: no network, an unknown format or result, a revenue that
+     * is not a digit string, revenue without a three letter currency, or
+     * revenue on a result other than shown.
+     */
+    fun trackAd(ad: RavensightAd): Boolean = safely("trackAd", false) {
+        val data = ad.eventData()
+        if (data == null) {
+            Log.w(TAG, "ad event refused locally: check network, format, result, and that revenue comes with a currency on a shown result")
+            false
+        } else {
+            controller?.track("rs_ad", data) ?: false
+        }
+    }
+
+    /** [trackAd] with result shown and revenue in micros of [currency]. */
+    fun trackAdRevenue(network: String, format: String, placement: String?, revenueMicros: String, currency: String): Boolean =
+        trackAd(RavensightAd(network, format, "shown", placement, revenueMicros, currency))
+
+    /**
+     * Records where this install came from, once per install: the first call
+     * queues one `rs_attribution` event and saves a flag beside the device
+     * id; later calls, in this run or any later one, return false.
+     * [resetDeviceId] forgets the flag.
+     */
+    fun setAttribution(attribution: RavensightAttribution): Boolean = safely("setAttribution", false) {
+        controller?.setAttribution(attribution) ?: false
+    }
+
     fun fetchConfig() = safely("fetchConfig") { controller?.fetchConfig() }
 
     @JvmStatic
@@ -540,6 +573,20 @@ object Ravensight {
 
         private val distribution = RavensightLimits.validDistribution(config.distribution)
 
+        /** The persisted queue, null when persistQueue is off or the run is inert. */
+        private val queueStore: RavensightQueueStore? =
+            if (config.persistQueue && !inert) RavensightQueueStore.forKey(app.filesDir, config.ingestKey) else null
+        private var queueLoaded = false
+        private var persistedRevision = 0L
+        private var persistScheduled = false
+        private val persistRunnable = Runnable { runSafely("persist") { persistScheduled = false; persistQueue() } }
+
+        /** Experiments exposed this run (a typed config read while assigned). */
+        private val exposed = ConcurrentHashMap<String, String>()
+
+        /** The device fields sent on the session (config.sendDeviceInfo). */
+        private val deviceFields: Map<String, String> = if (config.sendDeviceInfo) deps.deviceFields() else emptyMap()
+
         /** rs_event_id: a launch nonce from SecureRandom, the start time and a counter. */
         private val eventIds = RavensightEventIds(randomHex(4), clock() / 1000L)
 
@@ -661,7 +708,7 @@ object Ravensight {
                 return false
             }
             if (!active) return false
-            val at = clock() / 1000L
+            val at = clock()
             // Serialize here, on the caller's thread, into plain JSON values:
             // later mutation of the caller's map cannot race the worker, and a
             // value that cannot be serialized fails this call instead of
@@ -682,7 +729,7 @@ object Ravensight {
             // the same batch carries the same id. A value of the caller's
             // under that key is replaced.
             val snapshot = stamp(plain)
-            if (eventBytes(snapshot) > RavensightLimits.MAX_EVENT_BYTES) {
+            if (countedBytes(snapshot) > RavensightLimits.MAX_EVENT_BYTES) {
                 if (warnedTooLarge.compareAndSet(false, true)) {
                     Log.w(TAG, "dropped event \"$eventName\": its data is larger than ${RavensightLimits.MAX_EVENT_BYTES} bytes as JSON (later drops are counted, not logged)")
                 }
@@ -692,15 +739,29 @@ object Ravensight {
             }
             if (trailOn) trail.add(clock() - sessionStartMs, "track", eventName)
             post("track") {
-                core.track(eventName, snapshot, at)
+                core.track(eventName, snapshot, timestampMs = at)
+                schedulePersist()
                 if (core.queueSize >= RavensightCoreConfig.MAX_BATCH_SIZE) pump()
             }
             return true
         }
 
+        /** Once per install; see [Ravensight.setAttribution]. */
+        fun setAttribution(attribution: RavensightAttribution): Boolean {
+            val data = attribution.eventData()
+            if (data == null) {
+                Log.w(TAG, "attribution refused locally: source must be 1 to 64 characters and fields within their limits")
+                return false
+            }
+            if (prefs.getBoolean(KEY_ATTRIBUTION_SENT, false)) return false
+            if (!track("rs_attribution", data)) return false
+            prefs.edit().putBoolean(KEY_ATTRIBUTION_SENT, true).commit()
+            return true
+        }
+
         fun requestFlush() {
             post("flush") {
-                core.retryOnce()
+                core.flushNow()
                 pump()
             }
         }
@@ -735,24 +796,28 @@ object Ravensight {
             }
             if (inert || (consent == RavensightConsent.OPT_IN && optedOut)) {
                 // Not opted in (or inert): forget any saved id, make none.
-                prefs.edit().remove(KEY_DEVICE_ID).commit()
+                prefs.edit().remove(KEY_DEVICE_ID).remove(KEY_ATTRIBUTION_SENT).commit()
                 deviceId = null
+                exposed.clear()
                 post("resetDeviceId") {
                     core.clearQueue()
                     core.invalidateSession()
                     deleteMarker()
                     forgetCaptures()
+                    persistQueue()
                 }
                 return ""
             }
             val id = newDeviceId()
-            prefs.edit().putString(KEY_DEVICE_ID, id).commit()
+            prefs.edit().putString(KEY_DEVICE_ID, id).remove(KEY_ATTRIBUTION_SENT).commit()
             deviceId = id
+            exposed.clear()
             post("resetDeviceId") {
                 core.clearQueue()
                 core.invalidateSession()
                 deleteMarker()
                 forgetCaptures()
+                persistQueue()
             }
             return id
         }
@@ -916,7 +981,7 @@ object Ravensight {
                 endSessionAfterBackground(backgroundedAt)
                 queueGameStarted(now)
             } else if (backgroundedAt != null && config.trackPauseEvents) {
-                core.track("game_resumed", stamp(emptyMap()), now / 1000L)
+                core.track("game_resumed", stamp(emptyMap()), timestampMs = now)
             }
             if (core.isActive) scheduleTick()
             pump()
@@ -933,6 +998,7 @@ object Ravensight {
             collectEarlierCrashes(now)
             foregrounded = true
             queueGameStarted(now)
+            loadQueue(now)
             if (core.isActive) scheduleTick()
             pump()
         }
@@ -941,10 +1007,11 @@ object Ravensight {
             inForeground = false
             if (!foregrounded) return
             backgroundedAtMs = now
-            if (config.trackPauseEvents) core.track("game_paused", stamp(emptyMap()), now / 1000L)
+            if (config.trackPauseEvents) core.track("game_paused", stamp(emptyMap()), timestampMs = now)
             writeMarker(now)
             sendHealth(now)
             if (config.flushOnBackground) pump()
+            persistQueue()
         }
 
         /**
@@ -955,7 +1022,7 @@ object Ravensight {
             if (!config.performance || healthSent || !effectiveEnabled()) return
             val summary = frameSampler.summary() ?: return
             val data = TypedEvents.health(summary, deps.memoryMb(), bootMs)
-            if (core.track("health", stamp(data), now / 1000L)) healthSent = true
+            if (core.track("health", stamp(data), timestampMs = now)) healthSent = true
         }
 
         /** The app stayed in the background past the timeout: close the old session. */
@@ -990,11 +1057,18 @@ object Ravensight {
             startedQueued = true
             // First in the queue, so nothing tracked before the foreground
             // (a push handler, say) lands ahead of the session's start.
-            core.track("game_started", stamp(emptyMap()), now / 1000L, atHead = true)
+            core.track("game_started", stamp(emptyMap()), timestampMs = now, atHead = true)
         }
 
         private fun applyEnabled() {
             core.setEnabled(effectiveEnabled())
+            if (!effectiveEnabled() && optedOut && !isPlaytest) {
+                // The player said no: nothing tracked before may be sent later.
+                queueStore?.delete()
+                persistedRevision = core.revision
+            } else {
+                persistQueue()
+            }
             if (core.isActive) {
                 if (foregrounded) {
                     queueGameStarted(clock())
@@ -1034,18 +1108,44 @@ object Ravensight {
             deviceId = saved ?: newDeviceId().also { prefs.edit().putString(KEY_DEVICE_ID, it).commit() }
         }
 
-        /** A copy of [data] carrying the next rs_event_id. */
+        /**
+         * A copy of [data] carrying the next rs_event_id and the tags of the
+         * experiments exposed this run. A well-formed rs_exp_ value of the
+         * game's is kept; a malformed one is removed (and the SDK's own used).
+         */
         private fun stamp(data: Map<String, Any?>): Map<String, Any?> {
             val prefix = deviceId?.let { RavensightEventIds.prefixFor(it) } ?: launchPrefix
             val copy = LinkedHashMap(data)
-            cachedConfig()?.experiments?.forEach { (key, value) -> copy["rs_exp_$key"] = value }
+            copy.keys.filter { it.startsWith("rs_exp_") }.forEach { key ->
+                val value = copy[key] as? String
+                if (!EXPERIMENT_KEY.matches(key.removePrefix("rs_exp_")) || value == null || !VARIANT.matches(value)) copy.remove(key)
+            }
+            if (cachedConfig() != null) {
+                for ((key, variant) in exposed) if (!copy.containsKey("rs_exp_$key")) copy["rs_exp_$key"] = variant
+            }
             copy[RavensightLimits.EVENT_ID_KEY] = eventIds.next(prefix)
             return copy
         }
 
-        /** The size of an event's data as JSON in UTF-8 bytes, slashes unescaped as the server measures it. */
-        private fun eventBytes(data: Map<String, Any?>): Int =
-            RavensightJson.toJsonValue(data).toString().replace("\\/", "/").toByteArray(Charsets.UTF_8).size
+        /**
+         * A typed config read: every assigned experiment not yet exposed this
+         * run becomes exposed, and one rs_exposure event carrying their tags
+         * is queued.
+         */
+        private fun expose() {
+            val experiments = cachedConfig()?.experiments ?: return
+            var fresh = false
+            for ((key, variant) in experiments) if (exposed.putIfAbsent(key, variant) == null) fresh = true
+            if (fresh) track("rs_exposure", emptyMap())
+        }
+
+        /** A fetch replaced the assignments: stopped experiments are no longer tagged. */
+        private fun pruneExposed(experiments: Map<String, String>) {
+            for (key in exposed.keys.toList()) {
+                val variant = experiments[key]
+                if (variant == null) exposed.remove(key) else exposed[key] = variant
+            }
+        }
 
         // --- The exit marker ----------------------------------------------------
 
@@ -1174,7 +1274,11 @@ object Ravensight {
             return remoteConfig
         }
 
-        fun <T> getConfig(key: String, fallback: T): T = cachedConfig()?.get(key, fallback) ?: fallback
+        fun <T> getConfig(key: String, fallback: T): T {
+            val document = cachedConfig() ?: return fallback
+            expose()
+            return document.get(key, fallback)
+        }
 
         fun fetchConfig() {
             if (!active || !effectiveEnabled() || deviceId == null || !configPending.compareAndSet(false, true)) return
@@ -1191,6 +1295,7 @@ object Ravensight {
                     if (!active || !effectiveEnabled() || generation != configGeneration.get() || scope != currentConfigScope()) return@post
                     val fresh = if (result.status == 200) RemoteConfig.parse(result.body) else null
                     if (fresh != null) {
+                        pruneExposed(fresh.experiments)
                         synchronized(this) {
                             remoteConfig = fresh; remoteScope = scope
                             if (!isPlaytest) prefs.edit().putString("config_scope", scope).putString("config_document", fresh.raw).apply()
@@ -1214,8 +1319,11 @@ object Ravensight {
                 .put("platform", "android")
                 .put("sdk", "android/$VERSION")
             distribution?.let { body.put("distribution", it) }
+            if (deviceFields.isNotEmpty()) body.put("device", JSONObject(deviceFields as Map<*, *>))
             val result = transport.request("POST", "$apiUrl/session", headers("X-API-Key" to config.ingestKey), body.toString())
             val json = result.json
+            val signing = json?.optJSONObject("signing")?.takeIf { it.optString("algorithm") == "HMAC-SHA256" }
+            @Suppress("UNCHECKED_CAST")
             val outcome = core.onSessionResult(
                 status = result.status,
                 token = json?.optString("token")?.takeIf { it.isNotEmpty() },
@@ -1223,6 +1331,9 @@ object Ravensight {
                 expiresInSec = json?.optLong("expiresIn")?.takeIf { it > 0 },
                 retryAfterSec = result.retryAfterSec,
                 errorCode = json?.optString("error")?.takeIf { it.isNotEmpty() },
+                origin = json?.optJSONObject("origin")?.let { RavensightJson.toPlain(it) as Map<String, Any?> },
+                signingSecret = signing?.optString("secret")?.takeIf { it.isNotEmpty() },
+                serverTimeSec = signing?.optLong("serverTime")?.takeIf { it > 0 },
             )
             when (outcome) {
                 is SessionOutcome.Ready -> {
@@ -1250,17 +1361,36 @@ object Ravensight {
 
         private fun sendBatch(events: List<RavensightEvent>) {
             val token = core.sessionToken ?: return
+            val current = core.sessionOrigin?.get("session") as? String
             val payload = JSONObject().put(
                 "events",
                 RavensightJson.toJsonValue(
                     events.map {
-                        mapOf("event" to it.name, "data" to it.data, "timestamp" to it.timestampSec)
+                        val item = linkedMapOf<String, Any?>("event" to it.name, "data" to it.data, "timestamp" to it.timestampMs)
+                        // Tracked under an earlier session: that session's origin, verbatim.
+                        if (it.origin != null && it.originSession != current) item["origin"] = it.origin
+                        item
                     },
                 ),
             )
-            val result = transport.request("POST", "$apiUrl/track/batch", headers("X-Session-Token" to token), payload.toString())
+            val body = payload.toString()
+            val requestHeaders = headers("X-Session-Token" to token).toMutableMap()
+            core.signingSecret?.let { secret ->
+                // Over the exact bytes sent, before compression.
+                val timestamp = (clock() + core.clockOffsetMs) / 1000L
+                requestHeaders["X-Ravensight-Timestamp"] = timestamp.toString()
+                requestHeaders["X-Ravensight-Signature"] = RavensightWire.signatureHeader(secret, timestamp, body)
+            }
+            val compressed = !core.gzipRefused && body.toByteArray(Charsets.UTF_8).size >= RavensightWire.GZIP_THRESHOLD
+            // The transport compresses a body marked gzip.
+            if (compressed) requestHeaders["Content-Encoding"] = "gzip"
+            val result = transport.request("POST", "$apiUrl/track/batch", requestHeaders, body)
             val errorCode = result.json?.optString("error")?.takeIf { it.isNotEmpty() }
-            when (val outcome = core.onBatchResult(result.status, result.retryAfterSec, errorCode)) {
+            val index = result.json?.takeIf { it.has("index") }?.optInt("index", -1)?.takeIf { it >= 0 }
+            val outcome = core.onBatchResult(result.status, result.retryAfterSec, errorCode, index, compressed)
+            // The removal is on disk before anything else happens.
+            persistQueue()
+            when (outcome) {
                 is BatchOutcome.Flushed -> {
                     verbose("flushed ${outcome.count} events")
                     emit { it.onEventsFlushed(outcome.count) }
@@ -1273,7 +1403,9 @@ object Ravensight {
                 is BatchOutcome.BatchSplit ->
                     verbose("batch rejected, splitting to ${outcome.newLimit}")
                 is BatchOutcome.EventRejected ->
-                    logOnce("event_rejected", Log.WARN, "dropped an event the server rejected with HTTP 400 (counted as dropped)")
+                    logOnce("event_rejected", Log.WARN, "dropped ${outcome.count} event(s) the server rejected with HTTP ${result.status} (counted as dropped)")
+                is BatchOutcome.PlainBodyRequired ->
+                    verbose("compressed body refused (HTTP 415), sending uncompressed")
                 is BatchOutcome.Failed -> {
                     verbose("batch flush failed (${outcome.reason}), will retry")
                     emit { it.onFlushFailed(outcome.reason) }
@@ -1459,7 +1591,7 @@ object Ravensight {
         }
 
         private fun queueCapture(error: AutoError, data: Map<String, Any?>) {
-            core.track("error", stamp(data), error.atMs / 1000L, auto = true)
+            core.track("error", stamp(data), timestampMs = error.atMs, auto = true)
         }
 
         /** Reads `errorCapture: { enabled, trail }` from a settings or session answer. */
@@ -1574,6 +1706,41 @@ object Ravensight {
             "1.0.0"
         }
 
+        // --- The persisted queue, worker thread only ------------------------------
+
+        /** Reads the queue file once, when the first foreground may send. */
+        private fun loadQueue(now: Long) {
+            if (queueLoaded) return
+            queueLoaded = true
+            val store = queueStore ?: return
+            if (isPlaytest || !core.isActive) return
+            val loaded = store.load(now, config.maxQueueSize)
+            core.countDropped(loaded.dropped)
+            core.restore(loaded.events)
+            if (loaded.events.isNotEmpty()) verbose("restored ${loaded.events.size} event(s) from the queue file")
+            if (loaded.dropped > 0) persistQueue() else persistedRevision = core.revision
+        }
+
+        /** Writes the queue file within about a second of a change. */
+        private fun schedulePersist() {
+            if (queueStore == null || persistScheduled || core.revision == persistedRevision) return
+            persistScheduled = true
+            worker.postDelayed(persistRunnable, PERSIST_DELAY_MS)
+        }
+
+        /** Writes the queue file now when the queue changed. Never in a playtest run. */
+        private fun persistQueue() {
+            val store = queueStore ?: return
+            if (isPlaytest || !queueLoaded || core.revision == persistedRevision) return
+            persistedRevision = core.revision
+            if (!store.save(core.snapshot())) {
+                logOnce("queue_write", Log.WARN, "could not write the queue file; events stay in memory")
+            }
+        }
+
+        /** The size the server's 8 KB ceiling counts (an error event's text one byte a character). */
+        private fun countedBytes(data: Map<String, Any?>): Int = Ravensight.countedBytes(data)
+
         internal fun shutdownForTest() {
             if (CrashHandler.sink === crashSink) CrashHandler.sink = null
             uiForeground = false
@@ -1591,6 +1758,66 @@ object Ravensight {
     }
 
     private const val MAX_DRAIN_STEPS = 20
+
+    /** How long a queue change may wait before the queue file is written. */
+    internal const val PERSIST_DELAY_MS = 1000L
+
+    internal val EXPERIMENT_KEY = Regex("^[a-z][a-z0-9_]{0,63}$")
+    internal val VARIANT = Regex("^[a-z][a-z0-9_-]{0,39}$")
+
+    /** A typed error event's text caps, in UTF-16 units. */
+    private val TYPED_TEXT_CAPS = listOf("rs_message" to 200, "rs_stack" to 2000, "rs_trail" to 1500)
+
+    /** An event's data as JSON, slashes unescaped as the server writes it. */
+    internal fun jsonText(value: Any?): String = RavensightJson.toJsonValue(value).toString().replace("\\/", "/")
+
+    /**
+     * The size the server's 8 KB ceiling counts for one event's data: its
+     * UTF-8 JSON bytes, except that an error event's rs_message (200),
+     * rs_stack (2,000) and rs_trail (1,500) within their caps count one byte
+     * a UTF-16 unit (docs/errors/CONTRACT.md defines the fields).
+     */
+    internal fun countedBytes(data: Map<String, Any?>): Int {
+        var size = jsonText(data).toByteArray(Charsets.UTF_8).size
+        if (data["rs_kind"] != "error") return size
+        for ((key, cap) in TYPED_TEXT_CAPS) {
+            val value = data[key] as? String ?: continue
+            if (value.length > cap) continue
+            size -= org.json.JSONObject.quote(value).replace("\\/", "/").toByteArray(Charsets.UTF_8).size - value.length
+        }
+        return size
+    }
+
+    /**
+     * The model as sent. Meta Quest headsets run Horizon OS, which is Android:
+     * Build.MANUFACTURER is "Oculus" (or "Meta") and Build.MODEL is the bare
+     * name ("Quest 3"), so it is sent as "Meta Quest 3" to tell a headset from
+     * a phone. Every other device sends Build.MODEL unchanged.
+     */
+    internal fun deviceModel(manufacturer: String?, model: String?): String {
+        val name = model.orEmpty().trim()
+        val maker = manufacturer.orEmpty().trim().lowercase()
+        if ((maker == "oculus" || maker == "meta") && name.isNotEmpty() && !name.startsWith("Meta", ignoreCase = true)) {
+            return "Meta $name"
+        }
+        return name
+    }
+
+    /** True on a Meta Quest headset (Horizon OS). */
+    internal fun isQuest(manufacturer: String?, model: String?): Boolean {
+        val maker = manufacturer.orEmpty().trim().lowercase()
+        return (maker == "oculus" || maker == "meta") && model.orEmpty().contains("Quest", ignoreCase = true)
+    }
+
+    /** Build.MODEL and Build.VERSION.RELEASE: printable, trimmed, at most 128 characters. */
+    internal fun defaultDeviceFields(): Map<String, String> {
+        fun clean(value: String?): String =
+            value.orEmpty().filter { it >= ' ' && it != '\u007f' }.trim().take(128)
+        val fields = linkedMapOf<String, String>()
+        clean(deviceModel(android.os.Build.MANUFACTURER, android.os.Build.MODEL)).takeIf { it.isNotEmpty() }?.let { fields["model"] = it }
+        clean(android.os.Build.VERSION.RELEASE).takeIf { it.isNotEmpty() }?.let { fields["osVersion"] = it }
+        return fields
+    }
 }
 
 /** Where the SDK's worker messages run. A HandlerThread in production, a manual queue in tests. */
@@ -1644,6 +1871,8 @@ internal class RavensightDeps(
     val exitReasons: (Context) -> List<ExitRecord> = { SystemExitReasons.read(it) },
     /** Set the process-wide uncaught exception handler. Tests that drive the hook by hand turn it off. */
     val installCrashHandler: Boolean = true,
+    /** The device fields sent on the session. */
+    val deviceFields: () -> Map<String, String> = { Ravensight.defaultDeviceFields() },
 )
 
 /** Where frame callbacks are scheduled. The Choreographer in production. */

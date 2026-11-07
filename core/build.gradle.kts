@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.github.Reality-Software-Entertainment.ravensight-android"
-version = "0.4.0"
+version = "0.5.0"
 
 kotlin {
     jvmToolchain(17)

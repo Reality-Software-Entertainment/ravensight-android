@@ -51,6 +51,22 @@ class RavensightConfig @JvmOverloads constructor(
     /** When true (the default) the SDK flushes queued events every time the app leaves the foreground. */
     val flushOnBackground: Boolean = true,
     /**
+     * Keep unsent events in a file in the app's private files directory, so
+     * events tracked offline or just before a crash or a kill are sent on the
+     * next launch, under the session, build and platform they were tracked in
+     * (queue format version 2). On by default. Written within about a second
+     * of a change, atomically, and on every background; deleted when the
+     * queue is empty, the player opts out or the device id is reset. Events
+     * older than 89 days are dropped when it is read. False keeps the queue in
+     * memory only. Never used during a playtest run.
+     */
+    val persistQueue: Boolean = true,
+    /**
+     * Send Build.MODEL and Build.VERSION.RELEASE on the session (no
+     * permission, no hardware identifier). On by default.
+     */
+    val sendDeviceInfo: Boolean = true,
+    /**
      * Logs SDK activity to Logcat under the "Ravensight" tag, and warns about
      * an rs_kind outside [RS_KINDS] or an unknown rs_ key.
      */

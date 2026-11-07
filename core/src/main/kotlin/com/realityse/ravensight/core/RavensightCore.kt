@@ -9,11 +9,25 @@ import kotlin.random.Random
 class RavensightEvent(
     val name: String,
     val data: Map<String, Any?>,
-    /** Unix seconds, captured when the event happened. */
-    val timestampSec: Long,
+    /** Unix milliseconds, captured when the event happened. */
+    val timestampMs: Long,
+    /**
+     * The /session answer's origin of the session this event was tracked
+     * under, exactly as received, or null when that session had none or none
+     * was open yet. Sent when it is not the current session's.
+     */
+    var origin: Map<String, Any?>? = null,
     /** An automatic error capture: gameplay events keep their place ahead of it. */
     val auto: Boolean = false,
-)
+    /** Loaded from the queue file: never given the current session's origin. */
+    val restored: Boolean = false,
+) {
+    /** Unix seconds, for code written before timestamps were milliseconds. */
+    val timestampSec: Long get() = timestampMs / 1000L
+
+    /** The session id inside [origin], or null. */
+    val originSession: String? get() = origin?.get("session") as? String
+}
 
 /**
  * The reason vocabulary shared by every Ravensight SDK. [RavensightCore.reason]
@@ -86,8 +100,11 @@ class RavensightCoreConfig(
         const val DEFAULT_RETRY_MS: Long = 10_000L
         const val MAX_BACKOFF_MS: Long = 300_000L
 
-        /** Retry waits without a Retry-After vary by this fraction either way. */
-        const val BACKOFF_JITTER: Double = 0.2
+        /** Retry waits without a Retry-After are multiplied by a factor in [this, 1). */
+        const val BACKOFF_JITTER_FLOOR: Double = 0.5
+
+        /** Events older than this are dropped when the queue file is read. */
+        const val MAX_QUEUED_AGE_MS: Long = 89L * 24 * 60 * 60 * 1000
         const val MIN_RETRY_MS: Long = 500L
     }
 }
@@ -135,11 +152,14 @@ sealed class BatchOutcome {
     /** 429: the queue is held until the retry window passes. */
     class RateLimited(val reason: String) : BatchOutcome()
 
-    /** 400 or 413 on a multi-event batch: the next batch is halved to [newLimit]. */
+    /** 400 batch_too_large or 413 on a multi-event batch: the next batch is halved to [newLimit]. */
     class BatchSplit(val newLimit: Int) : BatchOutcome()
 
-    /** 400 or 413 on a single event: that event was dropped so it cannot block the queue. */
-    object EventRejected : BatchOutcome()
+    /** A 400 naming one event, any other 400, or a 413 on one event: [count] events were dropped. */
+    class EventRejected(val count: Int = 1) : BatchOutcome()
+
+    /** 415 on a compressed body: resend uncompressed from now on. */
+    object PlainBodyRequired : BatchOutcome()
 
     /** Anything else: backoff scheduled, the batch stays queued. */
     class Failed(val reason: String) : BatchOutcome()
@@ -201,6 +221,27 @@ class RavensightCore(
     private var batchLimit = maxBatch
     private var consecutiveAuthFailures = 0
     private var inFlightBatchSize = 0
+    private var retryAfterUntilMs = 0L
+
+    /** The current session's origin, exactly as the /session answer gave it. */
+    var sessionOrigin: Map<String, Any?>? = null
+        private set
+
+    /** The current session's signing secret, memory only. */
+    var signingSecret: String? = null
+        private set
+
+    /** The server's clock minus the device's, measured at the session answer. */
+    var clockOffsetMs: Long = 0L
+        private set
+
+    /** Set after a 415 on a compressed body: plain bodies for the run. */
+    var gzipRefused: Boolean = false
+        private set
+
+    /** Grows on every change to the queued events, so a driver that saves them knows when to write. */
+    var revision: Long = 0L
+        private set
 
     /** Set by a refused ingest key. Automatic attempts stop; [retryOnce] allows one more. */
     var keyRefused: Boolean = false
@@ -287,28 +328,75 @@ class RavensightCore(
         timestampSec: Long? = null,
         atHead: Boolean = false,
         auto: Boolean = false,
+        timestampMs: Long? = null,
     ): Boolean {
         if (name.isBlank()) return false
         if (!isActive) return false
 
+        // The queue rule for every SDK: at the cap the oldest capture goes
+        // first, whichever event is coming in; a capture never evicts a
+        // gameplay event, so with no capture queued an incoming one is dropped.
         while (queue.size >= queueCap) {
-            if (auto) {
+            val at = firstAuto()
+            if (at < 0 && auto) {
                 dropped++
                 return false
             }
-            var at = -1
-            for (i in inFlightBatchSize until queue.size) {
-                if (queue[i].auto) {
-                    at = i
-                    break
-                }
-            }
+            queue.removeAt(if (at >= 0) at else oldestNotInFlightCapture())
+            dropped++
+        }
+        val event = RavensightEvent(
+            name, data, timestampMs ?: timestampSec?.let { it * 1000L } ?: nowMs(),
+            origin = if (isSessionValid()) sessionOrigin else null,
+            auto = auto,
+        )
+        val firstAuto = if (auto) -1 else firstAuto()
+        when {
+            atHead -> queue.addFirst(event)
+            firstAuto >= 0 -> queue.add(firstAuto, event)
+            else -> queue.addLast(event)
+        }
+        revision++
+        return true
+    }
+
+    /** The oldest event that is not a capture in the batch in flight. */
+    private fun oldestNotInFlightCapture(): Int {
+        for (i in queue.indices) if (!(i < inFlightBatchSize && queue[i].auto)) return i
+        return 0
+    }
+
+    /** The first queued automatic error outside a batch in flight, or -1. */
+    private fun firstAuto(): Int {
+        for (i in inFlightBatchSize until queue.size) if (queue[i].auto) return i
+        return -1
+    }
+
+    /**
+     * Puts events loaded from the queue file back at the front of the queue,
+     * keeping each one's origin. The cap still applies, oldest first.
+     */
+    fun restore(events: List<RavensightEvent>) {
+        if (!isActive || events.isEmpty()) return
+        for (event in events.asReversed()) queue.addFirst(event)
+        while (queue.size > queueCap) {
+            val at = firstAuto()
             if (at >= 0) queue.removeAt(at) else queue.removeFirst()
             dropped++
         }
-        val event = RavensightEvent(name, data, timestampSec ?: (nowMs() / 1000L), auto)
-        if (atHead) queue.addFirst(event) else queue.addLast(event)
-        return true
+        revision++
+    }
+
+    /** A copy of the queued events, oldest first, for the queue file. */
+    fun snapshot(): List<RavensightEvent> = queue.toList()
+
+    /**
+     * An explicit flush: cuts a backoff wait short, never a server's
+     * Retry-After, and after a refused key allows one more attempt.
+     */
+    fun flushNow() {
+        retryOnce()
+        if (nowMs() >= retryAfterUntilMs) nextAttemptAtMs = 0L
     }
 
     /**
@@ -323,6 +411,8 @@ class RavensightCore(
     fun invalidateSession() {
         sessionToken = null
         sessionExpiresAtMs = 0L
+        sessionOrigin = null
+        signingSecret = null
     }
 
     /**
@@ -350,12 +440,14 @@ class RavensightCore(
      * Applies a 401 or 403 answer from any endpoint ([RavensightReason.forRefusal]).
      * Returns the reason so the caller can report it.
      */
-    fun onRefused(reason: String): String {
+    fun onRefused(reason: String, keepQueue: Boolean = false): String {
         when (reason) {
             RavensightReason.INVALID_KEY -> keyRefused = true
             RavensightReason.TRACKING_DISABLED -> {
+                // On a batch the events stay queued (and on disk) for the next
+                // launch; the settings check or a session open discards them.
                 trackingEnabled = false
-                clearQueue()
+                if (!keepQueue) clearQueue()
                 invalidateSession()
             }
             else -> stopForRun(reason)
@@ -382,7 +474,9 @@ class RavensightCore(
     /** Discards everything queued, counting it as dropped. */
     fun clearQueue() {
         dropped += queue.size
+        if (queue.isNotEmpty()) revision++
         queue.clear()
+        inFlightBatchSize = 0
     }
 
     // --- The driver loop ---------------------------------------------------
@@ -397,7 +491,9 @@ class RavensightCore(
         if (!trackingEnabled) return RavensightAction.Idle
 
         val now = nowMs()
-        if (now < nextAttemptAtMs) return RavensightAction.WaitUntil(nextAttemptAtMs)
+        if (now < maxOf(nextAttemptAtMs, retryAfterUntilMs)) {
+            return RavensightAction.WaitUntil(maxOf(nextAttemptAtMs, retryAfterUntilMs))
+        }
         if (!settingsChecked) return RavensightAction.CheckSettings
 
         if (!isSessionValid()) {
@@ -466,11 +562,29 @@ class RavensightCore(
         expiresInSec: Long? = null,
         retryAfterSec: Long? = null,
         errorCode: String? = null,
+        origin: Map<String, Any?>? = null,
+        signingSecret: String? = null,
+        serverTimeSec: Long? = null,
     ): SessionOutcome {
         wantSession = false
 
         if (status == 201 && !token.isNullOrEmpty()) {
             sessionToken = token
+            sessionOrigin = origin
+            if (origin != null) {
+                var changed = false
+                for (event in queue) if (!event.restored && event.origin == null) {
+                    event.origin = origin
+                    changed = true
+                }
+                if (changed) revision++
+            }
+            this.signingSecret = signingSecret?.takeIf { it.isNotEmpty() }
+            clockOffsetMs = if (this.signingSecret != null && serverTimeSec != null && serverTimeSec > 0) {
+                serverTimeSec * 1000L - nowMs()
+            } else {
+                0L
+            }
             sessionExpiresAtMs = when {
                 expiresAtSec != null && expiresAtSec > 0 -> expiresAtSec * 1000L
                 else -> nowMs() + (expiresInSec ?: 86_400L) * 1000L
@@ -516,14 +630,17 @@ class RavensightCore(
         status: Int,
         retryAfterSec: Long? = null,
         errorCode: String? = null,
+        index: Int? = null,
+        compressed: Boolean = false,
     ): BatchOutcome {
         val batchSize = inFlightBatchSize
         inFlightBatchSize = 0
 
         when (status) {
-            202 -> {
+            in 200..299 -> {
                 val removed = minOf(batchSize, queue.size)
                 repeat(removed) { queue.removeFirst() }
+                if (removed > 0) revision++
                 sent += removed
                 flushes++
                 batchLimit = maxBatch
@@ -534,19 +651,21 @@ class RavensightCore(
             }
 
             401 -> {
-                // Session expired or revoked. The batch stays queued and is
-                // re-sent as soon as a fresh session is issued. Repeated 401s
-                // on freshly issued tokens fall back to the backoff schedule
-                // instead of looping hot.
+                // Session expired or revoked, or a signature refused. The
+                // batch stays queued and is re-sent, with the same ids, under
+                // a fresh session opened once; a second 401 in a row waits for
+                // the backoff.
                 invalidateSession()
                 consecutiveAuthFailures++
-                if (consecutiveAuthFailures > 2) scheduleRetry(null)
+                if (consecutiveAuthFailures > 1) scheduleRetry(null)
                 return BatchOutcome.SessionExpired
             }
 
             403 -> {
+                // Stops sending for the run; the events stay queued, and on
+                // disk, for the next launch.
                 val reason = RavensightReason.forRefusal(status, errorCode) ?: RavensightReason.INVALID_KEY
-                return BatchOutcome.Refused(onRefused(reason))
+                return BatchOutcome.Refused(onRefused(reason, keepQueue = true))
             }
 
             429 -> {
@@ -555,21 +674,31 @@ class RavensightCore(
                 return BatchOutcome.RateLimited(errorCode ?: "rate_limited")
             }
 
-            // A 413 (body too large) is the same problem as a 400: split,
-            // then drop the one bad event, never retry it as is.
-            400, 413 -> {
-                if (batchSize > 1) {
+            400, 413, 415 -> {
+                if (status == 415 && compressed && !gzipRefused) {
+                    gzipRefused = true
+                    return BatchOutcome.PlainBodyRequired
+                }
+                if (status == 400 && index != null && index in 0 until minOf(batchSize, queue.size)) {
+                    queue.removeAt(index)
+                    dropped++
+                    revision++
+                    batchLimit = maxBatch
+                    return BatchOutcome.EventRejected(1)
+                }
+                val tooLarge = status == 413 || errorCode == "batch_too_large"
+                if (tooLarge && batchSize > 1) {
                     batchLimit = (batchSize / 2).coerceAtLeast(1)
                     return BatchOutcome.BatchSplit(batchLimit)
                 }
-                // A single event the server will never take. Drop it so the
-                // rest of the queue is not blocked behind it forever.
-                if (queue.isNotEmpty()) {
-                    queue.removeFirst()
-                    dropped++
-                }
+                // The request's events will never be taken: drop them so the
+                // rest of the queue is not blocked behind them.
+                val removed = minOf(batchSize, queue.size)
+                repeat(removed) { queue.removeFirst() }
+                if (removed > 0) revision++
+                dropped += removed
                 batchLimit = maxBatch
-                return BatchOutcome.EventRejected
+                return BatchOutcome.EventRejected(removed)
             }
 
             else -> {
@@ -590,21 +719,23 @@ class RavensightCore(
     private fun resetBackoff() {
         backoffMs = config.initialRetryMs
         nextAttemptAtMs = 0L
+        retryAfterUntilMs = 0L
     }
 
     /**
      * Blocks network attempts for [explicitWaitMs] when the server said how
      * long (Retry-After, obeyed exactly), otherwise for the current backoff
-     * delay with plus or minus 20 percent jitter, never past the ceiling.
+     * delay times a random factor in [0.5, 1), never past the ceiling.
      * Either way the stored backoff doubles up to the ceiling, matching the
      * Godot SDK, and no wait is shorter than half a second.
      */
     private fun scheduleRetry(explicitWaitMs: Long?) {
         val wait = if (explicitWaitMs != null && explicitWaitMs > 0) {
+            retryAfterUntilMs = nowMs() + explicitWaitMs
             explicitWaitMs
         } else {
             val roll = config.random().coerceIn(0.0, 1.0)
-            val factor = 1 - RavensightCoreConfig.BACKOFF_JITTER + 2 * RavensightCoreConfig.BACKOFF_JITTER * roll
+            val factor = RavensightCoreConfig.BACKOFF_JITTER_FLOOR + (1 - RavensightCoreConfig.BACKOFF_JITTER_FLOOR) * roll
             Math.round(backoffMs * factor).coerceAtMost(config.maxBackoffMs)
         }
         backoffMs = (backoffMs * 2).coerceAtMost(config.maxBackoffMs)

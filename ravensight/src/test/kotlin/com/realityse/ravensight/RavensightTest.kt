@@ -148,8 +148,13 @@ class RavensightTest {
         assertEquals("\"" + "a".repeat(64) + "\"", requests.last().headers["If-None-Match"])
         assertEquals(config().ingestKey, requests.first().headers["X-API-Key"])
         assertTrue(requests.first().path.contains("&platform=android&gameVersion=1.0.0"))
+        // The typed reads above exposed the experiment: one rs_exposure. A
+        // well-formed game value is kept; a malformed one is replaced.
         Ravensight.track("level", mapOf("rs_exp_difficulty" to "forged")); Ravensight.flush(); worker.runDue()
-        assertEquals("easy", batchEvents().last { it.getString("event") == "level" }.getJSONObject("data").getString("rs_exp_difficulty"))
+        assertEquals("forged", batchEvents().last { it.getString("event") == "level" }.getJSONObject("data").getString("rs_exp_difficulty"))
+        Ravensight.track("level2", mapOf("rs_exp_difficulty" to "Bad Value")); Ravensight.flush(); worker.runDue()
+        assertEquals("easy", batchEvents().last { it.getString("event") == "level2" }.getJSONObject("data").getString("rs_exp_difficulty"))
+        assertEquals(1, batchEvents().count { it.getString("event") == "rs_exposure" })
         http.override = { req -> if (req.path.startsWith("/ingest/config?")) HttpResult(0, "", null) else null }
         Ravensight.fetchConfig(); worker.runDue(); assertEquals(3, Ravensight.getConfig("speed", 0))
         Ravensight.resetDeviceId(); assertEquals(0, Ravensight.getConfig("speed", 0)); worker.runDue()
@@ -398,7 +403,7 @@ class RavensightTest {
         advance(10_000)
         val started = batchEvents().filter { it.getString("event") == "game_started" }
         assertEquals(1, started.size)
-        assertEquals(startedAt / 1000, started[0].getLong("timestamp"))
+        assertEquals(startedAt, started[0].getLong("timestamp")) // milliseconds
         assertEquals(listOf("/settings", "/session", "/ingest/config", "/track/batch"), http.paths())
     }
 
@@ -443,7 +448,7 @@ class RavensightTest {
         assertEquals("tok_2", http.requests[3].headers["X-Session-Token"])
         val started = JSONObject(http.requests[3].body!!).getJSONArray("events").getJSONObject(0)
         assertEquals("game_started", started.getString("event"))
-        assertEquals(now / 1000, started.getLong("timestamp"))
+        assertEquals(now, started.getLong("timestamp")) // milliseconds
         assertFalse(prefs().contains(Ravensight.KEY_MARKER_TOKEN))
     }
 
@@ -1023,7 +1028,7 @@ class RavensightTest {
 
     @Test
     fun `the version constant is 0_3_0`() {
-        assertEquals("0.4.0", Ravensight.VERSION)
+        assertEquals("0.5.0", Ravensight.VERSION)
     }
 
     // --- 0.3.0 public build rules ------------------------------------------
@@ -1214,7 +1219,7 @@ class RavensightTest {
         Ravensight.track("e")
         worker.runDue()
         val sessions = http.paths().count { it == "/session" }
-        advance(7_999L)
+        advance(4_999L) // a factor of 0.5: half the 10 second backoff
         assertEquals(sessions, http.paths().count { it == "/session" })
         advance(1L)
         assertEquals(sessions + 1, http.paths().count { it == "/session" })
