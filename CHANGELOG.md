@@ -7,6 +7,9 @@ device field contracts.
 
 ### Added
 
+- Meta Quest: Horizon OS is Android, so the SDK runs there unchanged. A headset's
+  model is sent as `Meta Quest 3` (and so on) to tell it from a phone.
+
 - Persisted queue, on by default (`persistQueue`): queue format version 2,
   one file per ingest key, atomic, 500 events, 89 days, each group with its
   session's `origin`; events tracked under an earlier session are sent with

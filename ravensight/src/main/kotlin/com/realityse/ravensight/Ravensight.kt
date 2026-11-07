@@ -1788,12 +1788,33 @@ object Ravensight {
         return size
     }
 
+    /**
+     * The model as sent. Meta Quest headsets run Horizon OS, which is Android:
+     * Build.MANUFACTURER is "Oculus" (or "Meta") and Build.MODEL is the bare
+     * name ("Quest 3"), so it is sent as "Meta Quest 3" to tell a headset from
+     * a phone. Every other device sends Build.MODEL unchanged.
+     */
+    internal fun deviceModel(manufacturer: String?, model: String?): String {
+        val name = model.orEmpty().trim()
+        val maker = manufacturer.orEmpty().trim().lowercase()
+        if ((maker == "oculus" || maker == "meta") && name.isNotEmpty() && !name.startsWith("Meta", ignoreCase = true)) {
+            return "Meta $name"
+        }
+        return name
+    }
+
+    /** True on a Meta Quest headset (Horizon OS). */
+    internal fun isQuest(manufacturer: String?, model: String?): Boolean {
+        val maker = manufacturer.orEmpty().trim().lowercase()
+        return (maker == "oculus" || maker == "meta") && model.orEmpty().contains("Quest", ignoreCase = true)
+    }
+
     /** Build.MODEL and Build.VERSION.RELEASE: printable, trimmed, at most 128 characters. */
     internal fun defaultDeviceFields(): Map<String, String> {
         fun clean(value: String?): String =
             value.orEmpty().filter { it >= ' ' && it != '\u007f' }.trim().take(128)
         val fields = linkedMapOf<String, String>()
-        clean(android.os.Build.MODEL).takeIf { it.isNotEmpty() }?.let { fields["model"] = it }
+        clean(deviceModel(android.os.Build.MANUFACTURER, android.os.Build.MODEL)).takeIf { it.isNotEmpty() }?.let { fields["model"] = it }
         clean(android.os.Build.VERSION.RELEASE).takeIf { it.isNotEmpty() }?.let { fields["osVersion"] = it }
         return fields
     }

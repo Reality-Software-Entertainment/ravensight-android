@@ -556,7 +556,7 @@ the session (turn them off with `sendDeviceInfo = false`):
 
 | Field | What | Source |
 | --- | --- | --- |
-| `device.model` | the model name, such as `Pixel 7`, never a serial | `Build.MODEL` |
+| `device.model` | the model name, such as `Pixel 7`, never a serial; a Meta Quest headset (Horizon OS) is sent as `Meta Quest 3` | `Build.MODEL`, prefixed with `Meta` when `Build.MANUFACTURER` is `Oculus` or `Meta` |
 | `device.osVersion` | the Android version only, such as `14` | `Build.VERSION.RELEASE` |
 
 No GPU name is sent. Country is never sent by the SDK. Each value is

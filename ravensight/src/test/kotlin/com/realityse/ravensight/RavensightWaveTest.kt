@@ -261,6 +261,18 @@ class RavensightWaveTest {
         assertNull(fields["gpu"])
     }
 
+    @Test
+    fun `a Meta Quest headset is named as one, every other model is unchanged`() {
+        assertEquals("Meta Quest 3", Ravensight.deviceModel("Oculus", "Quest 3"))
+        assertEquals("Meta Quest Pro", Ravensight.deviceModel("oculus", " Quest Pro "))
+        assertEquals("Meta Quest 3S", Ravensight.deviceModel("Meta", "Quest 3S"))
+        assertEquals("Meta Quest 3", Ravensight.deviceModel("Meta", "Meta Quest 3"))
+        assertEquals("Pixel 7", Ravensight.deviceModel("Google", "Pixel 7"))
+        assertEquals("", Ravensight.deviceModel("Oculus", ""))
+        assertTrue(Ravensight.isQuest("Oculus", "Quest 2"))
+        assertFalse(Ravensight.isQuest("Google", "Pixel 7"))
+    }
+
     // --- Response table --------------------------------------------------------------
 
     @Test
