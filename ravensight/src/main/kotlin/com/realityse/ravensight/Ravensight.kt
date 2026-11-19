@@ -24,6 +24,7 @@ import com.realityse.ravensight.core.BatchOutcome
 import com.realityse.ravensight.core.ErrorCaptureState
 import com.realityse.ravensight.core.ExitReasons
 import com.realityse.ravensight.core.ExitRecord
+import com.realityse.ravensight.core.IdentifyRelation
 import com.realityse.ravensight.core.IdentifyState
 import com.realityse.ravensight.core.IdentifyStep
 import com.realityse.ravensight.core.RavensightAction
@@ -420,6 +421,8 @@ object Ravensight {
                 return@synchronized
             }
             val edit = prefs(context).edit().putBoolean(KEY_OPT_OUT, !enabled)
+            // Opting out forgets the identity, even before initialize or while inert.
+            if (!enabled) edit.remove(KEY_IDENTITY)
             if (c == null || c.consent == RavensightConsent.OPT_IN) {
                 if (enabled) edit.putBoolean(KEY_OPT_IN, true) else edit.remove(KEY_OPT_IN)
             }
@@ -839,7 +842,7 @@ object Ravensight {
         fun setOptedOut(value: Boolean) {
             configGeneration.incrementAndGet()
             // Opting out (or withdrawing consent) forgets the identity.
-            if (value) identity.forget()
+            if (value) forgetIdentity()
             optedOut = value
             applyFrameSampling()
             active = serverAllows && effectiveEnabled()
@@ -899,8 +902,11 @@ object Ravensight {
             }
             // A playtest run never stores or sends an identity.
             if (isPlaytest) return true
-            if (identity.isSame(accountId)) return true
-            if (identity.hasIdentity) resetIdentity()
+            when (identity.relation(accountId)) {
+                IdentifyRelation.SAME -> return true
+                IdentifyRelation.OTHER -> resetIdentity()
+                IdentifyRelation.HOLD, IdentifyRelation.NEW -> Unit
+            }
             if (!identity.accept(accountId, canStoreIdentity())) {
                 verbose("identify is not offered by this server; nothing is kept this launch")
                 return true
@@ -910,8 +916,15 @@ object Ravensight {
         }
 
         fun resetIdentity() {
-            if (!identity.forget()) return
+            if (!forgetIdentity()) return
             resetDeviceId()
+        }
+
+        /** Drops the identity, and any saved one even while inert. Whether there was one. */
+        private fun forgetIdentity(): Boolean {
+            val had = identity.forget() or prefs.contains(KEY_IDENTITY)
+            prefs.edit().remove(KEY_IDENTITY).commit()
+            return had
         }
 
         private fun canStoreIdentity(): Boolean = !inert && !isPlaytest && !optedOut
@@ -941,9 +954,10 @@ object Ravensight {
          * Sends the identity once for the current session, or asks for a
          * session when [wantSession]. Never touches the event queue. Worker only.
          */
-        private fun identifyIfDue(wantSession: Boolean) {
+        private fun identifyIfDue(wantSession: Boolean, freshToken: String? = null) {
             if (inert || isPlaytest || !foregrounded || !core.isActive || !effectiveEnabled()) return
-            val token = core.sessionToken?.takeIf { core.isSessionValid() }
+            // The token a session answer just returned is used as is, whatever the device clock says.
+            val token = freshToken ?: core.sessionToken?.takeIf { core.isSessionValid() }
             when (val step = identity.next(token, canStoreIdentity())) {
                 is IdentifyStep.Send -> {
                     val url = "$apiUrl/identify"
@@ -958,7 +972,9 @@ object Ravensight {
                         post("identify answer") { identifyAnswered(step.generation, result) }
                     })
                 }
-                IdentifyStep.NeedSession -> if (wantSession) {
+                // Never during a Retry-After, a backoff or a refused key: the
+                // next ordinary session carries the identify instead.
+                IdentifyStep.NeedSession -> if (wantSession && core.mayOpenSessionNow()) {
                     core.requestSession()
                     pump()
                 }
@@ -1502,7 +1518,7 @@ object Ravensight {
                     readErrorCapture(json)
                     if (!isPlaytest) {
                         identity.onSessionAnswer(json?.optJSONObject("identify")?.optString("salt")?.takeIf { it.isNotEmpty() })
-                        identifyIfDue(wantSession = false)
+                        identifyIfDue(wantSession = false, freshToken = core.sessionToken)
                     }
                     if (!inForeground) backgroundedAtMs?.let { writeMarker(it) }
                     if (foregrounded && core.isActive) scheduleTick()

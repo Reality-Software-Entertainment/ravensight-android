@@ -51,6 +51,18 @@ object RavensightIdentity {
     }
 }
 
+/** How an account id relates to the identity already stored or held. */
+enum class IdentifyRelation {
+    /** The same account, already known under this launch's salt: nothing to do. */
+    SAME,
+    /** Matches the stored identity, but the salt is not known yet: hold it. */
+    HOLD,
+    /** Another account than the stored or held one: reset first. */
+    OTHER,
+    /** Nothing stored or held. */
+    NEW,
+}
+
 /** What the driver should do for identify now. */
 sealed class IdentifyStep {
     object None : IdentifyStep()
@@ -77,6 +89,10 @@ class IdentifyState(stored: StoredIdentity?, private val persist: (StoredIdentit
     private var identifiedSession: String? = null
     /** Bumped by [forget]: an answer from before is stale. */
     private var generation = 0L
+    /** no_session answers in a row: a second one ends identify for the launch. */
+    private var noSessionStreak = 0
+    /** Two no_session answers in a row: stopped until [forget] (a sign-out). */
+    private var noSessionStopped = false
 
     val stored: StoredIdentity? @Synchronized get() = identity
     val isHeld: Boolean @Synchronized get() = heldAccountId != null
@@ -86,6 +102,21 @@ class IdentifyState(stored: StoredIdentity?, private val persist: (StoredIdentit
     @Synchronized
     fun isSame(accountId: String): Boolean =
         heldAccountId == accountId || identity?.let { RavensightIdentity.accountHash(accountId, it.salt) == it.accountHash } == true
+
+    /**
+     * How [accountId] relates to what is stored or held. Before this launch's
+     * salt is known a match with the stored identity is [IdentifyRelation.HOLD]:
+     * the salt that arrives may differ, and the id is hashed under it.
+     */
+    @Synchronized
+    fun relation(accountId: String): IdentifyRelation {
+        if (heldAccountId == accountId) return IdentifyRelation.SAME
+        val current = identity
+        if (current != null && RavensightIdentity.accountHash(accountId, current.salt) == current.accountHash) {
+            return if (launchSalt != null) IdentifyRelation.SAME else IdentifyRelation.HOLD
+        }
+        return if (current != null || heldAccountId != null) IdentifyRelation.OTHER else IdentifyRelation.NEW
+    }
 
     /**
      * Takes a valid account id (the caller runs a reset first for a different
@@ -113,6 +144,8 @@ class IdentifyState(stored: StoredIdentity?, private val persist: (StoredIdentit
         if (identity != null) store(null)
         heldAccountId = null
         identifiedSession = null
+        noSessionStreak = 0
+        noSessionStopped = false
         generation++
         return had
     }
@@ -147,7 +180,7 @@ class IdentifyState(stored: StoredIdentity?, private val persist: (StoredIdentit
             store(StoredIdentity(salt, RavensightIdentity.accountHash(held, salt)))
             heldAccountId = null
         }
-        if (stopped || saltMissing || (identity == null && heldAccountId == null)) return IdentifyStep.None
+        if (stopped || noSessionStopped || saltMissing || (identity == null && heldAccountId == null)) return IdentifyStep.None
         val current = identity
         if (token == null || salt == null || current == null) return IdentifyStep.NeedSession
         if (identifiedSession == token) return IdentifyStep.None
@@ -160,6 +193,16 @@ class IdentifyState(stored: StoredIdentity?, private val persist: (StoredIdentit
     fun onAnswer(generation: Long, status: Int, error: String?): RavensightIdentity.Outcome? {
         if (generation != this.generation) return null
         val outcome = RavensightIdentity.outcome(status, error)
+        if (status == 400 && error == "no_session") {
+            // Identify again after the next session opens, once.
+            noSessionStreak++
+            if (noSessionStreak >= 2) {
+                noSessionStopped = true
+                return RavensightIdentity.Outcome.STOP_FOR_LAUNCH
+            }
+        } else {
+            noSessionStreak = 0
+        }
         if (outcome == RavensightIdentity.Outcome.STOP_FOR_LAUNCH) stopped = true
         return outcome
     }
