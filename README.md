@@ -44,7 +44,7 @@ Then add the dependency (`app/build.gradle.kts`):
 
 ```kotlin
 dependencies {
-    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.5.0")
+    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.6.0")
 }
 ```
 
@@ -130,6 +130,7 @@ blocking, safe from any thread, and never throws.
 | `Ravensight.setTrackingEnabled(context, bool)` | The player's choice, saved across launches. Callable before `initialize`. |
 | `Ravensight.isTrackingEnabled(context)` | The player's saved choice. |
 | `Ravensight.resetDeviceId()` | New random id, saved; clears the queue and ends the session. Returns the new id. `resetDeviceId(context)` also works before `initialize`. |
+| `Ravensight.identify(accountId)` / `resetIdentity()` / `isIdentified` | Links this device to your game's own account after sign-in, and forgets it on sign-out. See "Identify players who sign in". |
 | `Ravensight.setEnabled(bool)` | The game's own switch, like `RavensightConfig.enabled`. Not saved. Callable before `initialize`. |
 | `Ravensight.statusReason` | Why the SDK is not delivering, or null. See "Status and failures". |
 | `Ravensight.sessionToken` | The current session token, or null until a session opens. |
@@ -529,6 +530,44 @@ Ravensight.setTrackingEnabled(context, true)
 
 Starting with `enabled = false` and calling `setEnabled(true)` still works,
 but it is not saved, so the game has to remember the answer itself.
+
+## Identify players who sign in
+
+If your game has its own sign-in, tell Ravensight who signed in so one person
+on two devices, or before and after sign-in, counts as one player:
+
+```kotlin
+Ravensight.identify(account.id)   // after your sign-in succeeds
+Ravensight.resetIdentity()        // on sign-out
+```
+
+- **What is sent.** Only a hash of the id, keyed with a salt that belongs to
+  your game, and the session token, once per session. The raw id and any
+  email are never sent and never saved. The same account in two games gives
+  two unrelated ids.
+- **Pass an opaque id**, such as your database key or a UUID, never an
+  email, a name or a platform handle. `identify` returns false, logs one
+  warning and does nothing for an id that is null, empty, longer than 256
+  UTF-8 bytes or contains `@`. It never throws. The id is used exactly as
+  given, never trimmed.
+- **It lasts.** The hash is saved beside the device id (`ravensight/identity`
+  in `SharedPreferences`, left out of backups by the same rules) and each
+  later session is identified with no call. Calling `identify` again with
+  the same account does nothing.
+- **Sign-out.** `resetIdentity()` forgets the saved identity and switches to
+  a fresh device id, like `resetDeviceId()`, so the next player on this
+  device is not counted as the last one. Identifying a different account
+  does this first on its own. `resetDeviceId()` alone keeps the identity.
+- **Consent.** Without a key, or with `consent = OPT_IN` before the player's
+  yes, the id is held in memory only and nothing is sent.
+  `setTrackingEnabled(context, false)` forgets the identity.
+- **Usage.** Each identified session is one event on your usage. Identify
+  never enters the event queue and runs on its own thread, so it never
+  delays your events. A playtest run never identifies.
+
+Your store privacy form: a game that calls `identify` links Ravensight data
+to the player's account, so declare the data types as linked to the player
+(and a User ID).
 
 ## Telling players
 

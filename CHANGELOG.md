@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.6.0] - 2026-11-19
+
+Needs a Ravensight server that offers identify (the session answer carries
+`identify.salt`). Against an older server identify does nothing.
+
+### Added
+
+- `Ravensight.identify(accountId)`, `Ravensight.resetIdentity()` and
+  `Ravensight.isIdentified`, for games with their own sign-in. The id is
+  checked on the device (not null, not empty, at most 256 UTF-8 bytes, no
+  `@`, never trimmed) and refused with `false` and one warning, never an
+  exception. Only an HMAC-SHA256 of the id, keyed with the game's salt from
+  the session answer, is sent to `POST /api/v1/identify`, once per session,
+  with the key and the session token, on its own thread. The raw id is held
+  in memory until the salt is known and is never saved: the prefs key
+  `identity` holds `{ salt, accountHash }`.
+- A stored identity made under another salt is deleted, never sent. A
+  different account runs `resetIdentity()` first. `resetIdentity()` deletes
+  the identity and switches to a fresh device id as `resetDeviceId()` does;
+  `resetDeviceId()` alone keeps it. Opting out deletes it.
+- Answers: 200 is done for the session; 404 and `invalid_account_hash` stop
+  identify for the launch; every other answer, offline included, waits for
+  the next session. No retry loop. Identify never enters the event queue or
+  the queue file.
+- Core: `RavensightIdentity` (validation, the hash, answers) and
+  `IdentifyState`, plain JVM.
+
 ## [0.5.0] - 2026-11-06
 
 Implements the Ravensight delivery, ads and attribution, exposure and

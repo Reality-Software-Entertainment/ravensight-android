@@ -59,7 +59,7 @@ import org.json.JSONObject
 object Ravensight {
 
     /** This SDK's version. */
-    const val VERSION: String = "0.5.0"
+    const val VERSION: String = "0.6.0"
 
     internal const val TAG = "Ravensight"
     internal const val PREFS = "ravensight"
