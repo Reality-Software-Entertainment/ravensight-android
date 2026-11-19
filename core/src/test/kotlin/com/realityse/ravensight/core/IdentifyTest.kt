@@ -72,7 +72,6 @@ class IdentifyTest {
 
     @Test
     fun `answers map to the contract's actions`() {
-        val o = RavensightIdentity.Outcome
         assertSame(RavensightIdentity.Outcome.DONE, RavensightIdentity.outcome(200, null))
         assertSame(RavensightIdentity.Outcome.STOP_FOR_LAUNCH, RavensightIdentity.outcome(404, null))
         assertSame(RavensightIdentity.Outcome.STOP_FOR_LAUNCH, RavensightIdentity.outcome(400, "invalid_account_hash"))
@@ -80,7 +79,7 @@ class IdentifyTest {
             429 to "identify_limited", 429 to "rate_limited", 429 to "quota_exceeded", 503 to null, 500 to null, 0 to null)) {
             assertSame("$status $error", RavensightIdentity.Outcome.NEXT_SESSION, RavensightIdentity.outcome(status, error))
         }
-        assertEquals(3, o.values().size)
+        assertEquals(3, RavensightIdentity.Outcome.values().size)
     }
 
     // --- The state ----------------------------------------------------------

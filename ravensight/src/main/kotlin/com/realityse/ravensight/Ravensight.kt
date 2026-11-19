@@ -24,15 +24,19 @@ import com.realityse.ravensight.core.BatchOutcome
 import com.realityse.ravensight.core.ErrorCaptureState
 import com.realityse.ravensight.core.ExitReasons
 import com.realityse.ravensight.core.ExitRecord
+import com.realityse.ravensight.core.IdentifyState
+import com.realityse.ravensight.core.IdentifyStep
 import com.realityse.ravensight.core.RavensightAction
 import com.realityse.ravensight.core.RavensightCore
 import com.realityse.ravensight.core.RavensightCoreConfig
 import com.realityse.ravensight.core.RavensightEvent
 import com.realityse.ravensight.core.RavensightEventIds
+import com.realityse.ravensight.core.RavensightIdentity
 import com.realityse.ravensight.core.RavensightLimits
 import com.realityse.ravensight.core.RavensightReason
 import com.realityse.ravensight.core.RavensightWire
 import com.realityse.ravensight.core.SessionOutcome
+import com.realityse.ravensight.core.StoredIdentity
 import com.realityse.ravensight.core.TrailRing
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
@@ -69,6 +73,8 @@ object Ravensight {
     /** The newest platform exit record already looked at (ApplicationExitInfo timestamp). */
     internal const val KEY_EXIT_SEEN_AT = "error_exit_seen_at_ms"
     internal const val KEY_ATTRIBUTION_SENT = "attribution_sent"
+    /** The stored identity, { salt, accountHash } as JSON. Never the account id. */
+    internal const val KEY_IDENTITY = "identity"
 
     internal const val EXTRA_PLAYTEST_TOKEN = "ravensight_playtest_token"
     internal const val EXTRA_PLAYTEST_RUN_ID = "ravensight_playtest_run_id"
@@ -473,6 +479,54 @@ object Ravensight {
     }
 
     /**
+     * Links this device to the game's own account, for a game with its own
+     * sign-in: call it after the player signs in. Only a salted hash of the
+     * id is sent, once per session, never the id itself, and the id is never
+     * saved. Pass an opaque internal id (a database key or UUID), never an
+     * email, a name or a platform handle.
+     *
+     * Returns false, with one warning, when the id is refused: null
+     * ("not_text"), empty ("empty"), more than 256 UTF-8 bytes ("too_long")
+     * or containing "@" ("looks_like_email"). A refusal sends nothing and
+     * changes nothing. The id is used exactly as given, never trimmed. The
+     * same account again does nothing; a different account runs
+     * [resetIdentity] first. Without a key, or with
+     * [RavensightConsent.OPT_IN] before the player's yes, the id is held in
+     * memory only. Returns false before [initialize]. Never throws.
+     */
+    @JvmStatic
+    fun identify(accountId: String?): Boolean = safely("identify", false) {
+        val c = controller
+        if (c == null) {
+            val reason = RavensightIdentity.refusal(accountId)
+            if (reason != null) warnIdentifyRefused(reason) else Log.w(TAG, "identify called before initialize; nothing was kept")
+            false
+        } else {
+            c.identify(accountId)
+        }
+    }
+
+    /**
+     * For sign-out: forgets the stored identity (and any id held in memory)
+     * and switches to a fresh device id exactly as [resetDeviceId] does, so
+     * the next session is not linked to the account. Does nothing when no
+     * identity is stored or held, and before [initialize]. Sends nothing.
+     */
+    @JvmStatic
+    fun resetIdentity() = safely("resetIdentity") {
+        controller?.resetIdentity()
+    }
+
+    /** True while an identity is stored, or a valid id is held in memory. */
+    @JvmStatic
+    val isIdentified: Boolean
+        get() = safely("isIdentified", false) { controller?.isIdentified ?: false }
+
+    internal fun warnIdentifyRefused(reason: String) {
+        Log.w(TAG, "identify refused ($reason): pass an opaque account id, 1 to 256 bytes, with no @. Nothing was sent or changed.")
+    }
+
+    /**
      * Marks this run as a Ravensight Playtest run. Normally not needed: the
      * SDK reads the token and run id from [RavensightConfig], the launch
      * intent extras "ravensight_playtest_token" and
@@ -649,6 +703,14 @@ object Ravensight {
         @Volatile private var sessionStartMs: Long = clock()
         private val crashSink: (Thread, Throwable) -> Unit = { thread, error -> recordCrash(thread, error) }
 
+        // Identify. The state is thread safe; its storage is these prefs.
+        private val identity = IdentifyState(if (inert) null else loadIdentity()) { saveIdentity(it) }
+        private val identifyExecutor = lazy {
+            java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ravensight-identify").apply { isDaemon = true } }
+        }
+        /** Identify requests run here, off the event worker, so they never delay a batch. */
+        private val identifyRunner: (Runnable) -> Unit = deps.identifyRunner ?: { identifyExecutor.value.execute(it) }
+
         private val pumpRunnable = Runnable { runSafely("pump") { pump() } }
         private val tickRunnable = Runnable {
             runSafely("flush timer") {
@@ -776,6 +838,8 @@ object Ravensight {
 
         fun setOptedOut(value: Boolean) {
             configGeneration.incrementAndGet()
+            // Opting out (or withdrawing consent) forgets the identity.
+            if (value) identity.forget()
             optedOut = value
             applyFrameSampling()
             active = serverAllows && effectiveEnabled()
@@ -820,6 +884,101 @@ object Ravensight {
                 persistQueue()
             }
             return id
+        }
+
+        // --- Identify, any thread ---------------------------------------------------
+
+        val isIdentified: Boolean get() = identity.hasIdentity
+        internal val identityHeldForTest: Boolean get() = identity.isHeld
+
+        fun identify(accountId: String?): Boolean {
+            val reason = RavensightIdentity.refusal(accountId)
+            if (reason != null || accountId == null) {
+                warnIdentifyRefused(reason ?: "not_text")
+                return false
+            }
+            // A playtest run never stores or sends an identity.
+            if (isPlaytest) return true
+            if (identity.isSame(accountId)) return true
+            if (identity.hasIdentity) resetIdentity()
+            if (!identity.accept(accountId, canStoreIdentity())) {
+                verbose("identify is not offered by this server; nothing is kept this launch")
+                return true
+            }
+            post("identify") { identifyIfDue(wantSession = true) }
+            return true
+        }
+
+        fun resetIdentity() {
+            if (!identity.forget()) return
+            resetDeviceId()
+        }
+
+        private fun canStoreIdentity(): Boolean = !inert && !isPlaytest && !optedOut
+
+        private fun loadIdentity(): StoredIdentity? = try {
+            prefs.getString(KEY_IDENTITY, null)?.let { JSONObject(it) }?.let { json ->
+                val salt = json.optString("salt")
+                val hash = json.optString("accountHash")
+                if (salt.isEmpty() || hash.isEmpty()) null else StoredIdentity(salt, hash)
+            }
+        } catch (t: Throwable) {
+            null
+        }
+
+        private fun saveIdentity(value: StoredIdentity?) {
+            if (inert) return
+            val edit = prefs.edit()
+            if (value == null) {
+                edit.remove(KEY_IDENTITY)
+            } else {
+                edit.putString(KEY_IDENTITY, JSONObject().put("salt", value.salt).put("accountHash", value.accountHash).toString())
+            }
+            edit.commit()
+        }
+
+        /**
+         * Sends the identity once for the current session, or asks for a
+         * session when [wantSession]. Never touches the event queue. Worker only.
+         */
+        private fun identifyIfDue(wantSession: Boolean) {
+            if (inert || isPlaytest || !foregrounded || !core.isActive || !effectiveEnabled()) return
+            val token = core.sessionToken?.takeIf { core.isSessionValid() }
+            when (val step = identity.next(token, canStoreIdentity())) {
+                is IdentifyStep.Send -> {
+                    val url = "$apiUrl/identify"
+                    val requestHeaders = headers("X-API-Key" to config.ingestKey, "X-Session-Token" to step.token)
+                    val body = JSONObject().put("accountHash", step.accountHash).toString()
+                    identifyRunner(Runnable {
+                        val result = try {
+                            transport.request("POST", url, requestHeaders, body)
+                        } catch (t: Throwable) {
+                            HttpResult(0, "", null)
+                        }
+                        post("identify answer") { identifyAnswered(step.generation, result) }
+                    })
+                }
+                IdentifyStep.NeedSession -> if (wantSession) {
+                    core.requestSession()
+                    pump()
+                }
+                IdentifyStep.None -> Unit
+            }
+        }
+
+        private fun identifyAnswered(generation: Long, result: HttpResult) {
+            val error = result.errorCode("http_${result.status}")
+            when (identity.onAnswer(generation, result.status, error)) {
+                null -> verbose("ignored an identify answer that no longer applies")
+                RavensightIdentity.Outcome.DONE -> verbose("identified this session")
+                RavensightIdentity.Outcome.NEXT_SESSION -> verbose("identify not accepted ($error), will try again next session")
+                RavensightIdentity.Outcome.STOP_FOR_LAUNCH ->
+                    if (error == "invalid_account_hash") {
+                        logOnce("identify_invalid", Log.WARN, "identify was refused as invalid_account_hash; not sent again this launch")
+                    } else {
+                        verbose("identify is not offered by this server ($error); not sent again this launch")
+                    }
+            }
         }
 
         fun setPlaytestContext(token: String, runId: String?, source: String) {
@@ -1001,6 +1160,7 @@ object Ravensight {
             loadQueue(now)
             if (core.isActive) scheduleTick()
             pump()
+            identifyIfDue(wantSession = true)
         }
 
         private fun background(now: Long) {
@@ -1074,6 +1234,7 @@ object Ravensight {
                     queueGameStarted(clock())
                     scheduleTick()
                     pump()
+                    identifyIfDue(wantSession = true)
                 }
             } else {
                 stopTick()
@@ -1339,6 +1500,10 @@ object Ravensight {
                 is SessionOutcome.Ready -> {
                     verbose("session ready")
                     readErrorCapture(json)
+                    if (!isPlaytest) {
+                        identity.onSessionAnswer(json?.optJSONObject("identify")?.optString("salt")?.takeIf { it.isNotEmpty() })
+                        identifyIfDue(wantSession = false)
+                    }
                     if (!inForeground) backgroundedAtMs?.let { writeMarker(it) }
                     if (foregrounded && core.isActive) scheduleTick()
                     emit { it.onSessionReady() }
@@ -1747,6 +1912,7 @@ object Ravensight {
             applyFrameSampling()
             (app as? Application)?.unregisterActivityLifecycleCallbacks(this)
             if (workerLazy.isInitialized()) (worker as? HandlerWorker)?.quit()
+            if (identifyExecutor.isInitialized()) identifyExecutor.value.shutdownNow()
         }
 
         internal fun queueSizeForTest(): Int = core.queueSize
@@ -1873,6 +2039,8 @@ internal class RavensightDeps(
     val installCrashHandler: Boolean = true,
     /** The device fields sent on the session. */
     val deviceFields: () -> Map<String, String> = { Ravensight.defaultDeviceFields() },
+    /** Runs identify requests; a single background thread by default. */
+    val identifyRunner: ((Runnable) -> Unit)? = null,
 )
 
 /** Where frame callbacks are scheduled. The Choreographer in production. */
