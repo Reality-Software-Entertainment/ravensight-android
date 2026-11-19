@@ -32,6 +32,14 @@ Needs a Ravensight server that offers identify (the session answer carries
   identity; the last call before the salt wins.
 - Core: `RavensightIdentity` (validation, the hash, answers) and
   `IdentifyState`, plain JVM.
+- `Ravensight.setCampaignLink(id)`: pass the `rs_link` id of the App Link
+  or deep link that brought the player. A link id (24 hex characters, any
+  case) is sent lower case, once, as `campaignLink` on the next
+  `POST /session`, and kept for the next attempt until a session opens;
+  anything else, null included, returns `false` and changes nothing. Memory
+  only, held before `initialize`, never sent by a playtest run, and under
+  the same key and consent rules as everything else. A server that does not
+  know the field ignores it. Core: `CampaignLinkState`, plain JVM.
 
 ## [0.5.0] - 2026-11-06
 
