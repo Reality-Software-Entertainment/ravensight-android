@@ -492,8 +492,11 @@ object Ravensight {
      * Links this device to the game's own account, for a game with its own
      * sign-in: call it after the player signs in. Only a salted hash of the
      * id is sent, once per session, never the id itself, and the id is never
-     * saved. Pass an opaque internal id (a database key or UUID), never an
-     * email, a name or a platform handle.
+     * saved. Pass a random, high-entropy id (a random UUID or analytics id
+     * stored with the account), never a sequential database key, an email, a
+     * name or a platform handle: the salt reaches every client, so a guessable
+     * id can be matched. The hash is a pseudonymous identifier to declare in
+     * the game's privacy notice.
      *
      * Returns false, with one warning, when the id is refused: null
      * ("not_text"), empty ("empty"), more than 256 UTF-8 bytes ("too_long")
