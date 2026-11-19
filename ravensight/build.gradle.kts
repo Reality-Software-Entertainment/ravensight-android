@@ -24,6 +24,8 @@ android {
     testOptions {
         unitTests.isIncludeAndroidResources = true
     }
+    // The shared test vectors live once, in core's test resources.
+    sourceSets.getByName("test").resources.srcDir("../core/src/test/resources")
 
     publishing {
         singleVariant("release") {
