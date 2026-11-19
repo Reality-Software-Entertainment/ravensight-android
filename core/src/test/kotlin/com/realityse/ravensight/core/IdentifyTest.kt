@@ -146,6 +146,30 @@ class IdentifyTest {
         assertSame(IdentifyStep.None, s.next("S2", canStore = true))
         assertTrue(s.stored != null)
     }
+
+    @Test
+    fun `the same id before the salt is held, not skipped`() {
+        val s = state(StoredIdentity(salt, RavensightIdentity.accountHash("u1", salt)))
+        assertSame(IdentifyRelation.HOLD, s.relation("u1"))
+        assertSame(IdentifyRelation.OTHER, s.relation("u2"))
+        s.onSessionAnswer(salt)
+        assertSame(IdentifyRelation.SAME, s.relation("u1"))
+        assertSame(IdentifyRelation.NEW, state().relation("u1"))
+    }
+
+    @Test
+    fun `a second no_session in a row stops, anything else resets the count`() {
+        val s = state()
+        s.onSessionAnswer(salt)
+        s.accept("u1", canStore = true)
+        fun answer(token: String, status: Int, error: String?) =
+            s.onAnswer((s.next(token, canStore = true) as IdentifyStep.Send).generation, status, error)
+        assertSame(RavensightIdentity.Outcome.NEXT_SESSION, answer("S1", 400, "no_session"))
+        assertSame(RavensightIdentity.Outcome.NEXT_SESSION, answer("S2", 503, null))
+        assertSame(RavensightIdentity.Outcome.NEXT_SESSION, answer("S3", 400, "no_session"))
+        assertSame(RavensightIdentity.Outcome.STOP_FOR_LAUNCH, answer("S4", 400, "no_session"))
+        assertSame(IdentifyStep.None, s.next("S5", canStore = true))
+    }
 }
 
 /** Just enough JSON for the fixtures: objects, arrays, strings, numbers, true, false, null. */

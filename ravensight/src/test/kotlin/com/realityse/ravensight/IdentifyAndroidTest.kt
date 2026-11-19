@@ -446,6 +446,165 @@ class IdentifyAndroidTest {
         assertNull(stored())
     }
 
+    // --- Flow review fixes ---------------------------------------------------------
+
+    private fun hmac(id: String, salt: String) = com.realityse.ravensight.core.RavensightIdentity.accountHash(id, salt)
+
+    @Test
+    fun `F1 no eager session during a Retry-After hold`() {
+        http.identifySalt = salt
+        init(); foreground()
+        http.batchStatus = 429
+        http.batchError = "rate_limited"
+        http.retryAfter = "120"
+        Ravensight.track("a"); flush()
+        assertEquals(1, sessions().size)
+        http.batchStatus = 202; http.batchError = null; http.retryAfter = null
+        Ravensight.resetDeviceId() // the session is gone; the hold is not
+        Ravensight.identify("u1")
+        settle()
+        now += 121_000
+        settle()
+        // Skipped, not deferred: no session opened just for identify.
+        assertEquals(1, sessions().size)
+        assertTrue(identifies().isEmpty())
+        // The next ordinary session carries it.
+        Ravensight.track("b"); flush()
+        assertEquals(listOf("tok_2"), tokens())
+    }
+
+    @Test
+    fun `F2 the same id before the salt is hashed under the salt that arrives`() {
+        http.identifySalt = salt
+        init(); foreground()
+        Ravensight.identify("u1")
+        settle()
+        assertEquals(salt, stored()!!.getString("salt"))
+        val other = vectors.getJSONObject("salts_differ").getString("salt_b")
+        http.identifySalt = other
+        Ravensight.resetForTest()
+        init()
+        assertTrue(Ravensight.identify("u1"))
+        foreground()
+        assertEquals(hmac("u1", other), hashes().last())
+        assertEquals(other, stored()!!.getString("salt"))
+        assertEquals(hmac("u1", other), stored()!!.getString("accountHash"))
+    }
+
+    @Test
+    fun `F3 collection back on inside an open session sends the identify`() {
+        http.identifySalt = salt
+        init(); foreground()
+        Ravensight.setEnabled(false)
+        assertTrue(Ravensight.identify("u1"))
+        settle()
+        assertTrue(identifies().isEmpty())
+        Ravensight.setEnabled(true)
+        settle()
+        assertEquals(hmac("u1", salt), hashes().single())
+
+        Ravensight.setTrackingEnabled(app, false)
+        assertTrue(Ravensight.identify("u2"))
+        settle()
+        Ravensight.setTrackingEnabled(app, true)
+        settle()
+        assertEquals(hmac("u2", salt), hashes().last())
+    }
+
+    private fun seedIdentity() {
+        prefs().edit()
+            .putString(Ravensight.KEY_IDENTITY, JSONObject().put("salt", salt).put("accountHash", hmac("u1", salt)).toString())
+            .putString(Ravensight.KEY_DEVICE_ID, "dev_" + "a".repeat(32))
+            .commit()
+    }
+
+    @Test
+    fun `F4 before consent a stored identity is deleted by a decline and by resetIdentity`() {
+        http.identifySalt = salt
+        seedIdentity()
+        init(config(ingestKey = "gt_pub_test", consent = RavensightConsent.OPT_IN))
+        foreground()
+        Ravensight.setTrackingEnabled(app, false)
+        assertNull(stored())
+
+        Ravensight.resetForTest()
+        seedIdentity()
+        init(config(ingestKey = "gt_pub_test", consent = RavensightConsent.OPT_IN))
+        foreground()
+        assertTrue(Ravensight.isIdentified)
+        Ravensight.resetIdentity()
+        settle()
+        assertNull(stored())
+        assertNotEquals("dev_" + "a".repeat(32), prefs().getString(Ravensight.KEY_DEVICE_ID, null))
+        Ravensight.setTrackingEnabled(app, true)
+        Ravensight.track("a"); flush()
+        assertTrue(identifies().isEmpty())
+    }
+
+    @Test
+    fun `F4 a keyless build and a call before initialize still delete a stored identity on opt-out`() {
+        seedIdentity()
+        Ravensight.setTrackingEnabled(app, false)
+        assertNull(stored())
+        seedIdentity()
+        init(config(ingestKey = ""))
+        Ravensight.setTrackingEnabled(app, false)
+        assertNull(stored())
+    }
+
+    @Test
+    fun `F6 two quick calls before the salt, the last one wins`() {
+        http.identifySalt = salt
+        init()
+        Ravensight.identify("u1")
+        Ravensight.identify("u2")
+        foreground()
+        assertEquals(listOf(hmac("u2", salt)), hashes())
+        assertEquals(hmac("u2", salt), stored()!!.getString("accountHash"))
+    }
+
+    @Test
+    fun `F7 sent on the token the session answer just returned`() {
+        http.identifySalt = salt
+        var first = true
+        http.override = { req ->
+            if (req.path == "/session" && first) {
+                first = false
+                HttpResult(201, "{\"token\":\"fresh\",\"expiresAt\":${now / 1000 - 10},\"identify\":{\"salt\":\"$salt\"}}", null)
+            } else null
+        }
+        init()
+        Ravensight.identify("u1")
+        foreground()
+        assertEquals("fresh", tokens().first())
+    }
+
+    @Test
+    fun `F8 a second no_session in a row stops and other answers reset the count`() {
+        http.identifySalt = salt
+        http.identifyStatus = 400
+        http.identifyError = "no_session"
+        init(); foreground()
+        Ravensight.identify("u1")
+        settle()
+        fun nextSession() { Ravensight.resetDeviceId(); Ravensight.track("x"); flush() }
+        nextSession()
+        assertEquals(2, identifies().size)
+        nextSession()
+        assertEquals(2, identifies().size)
+
+        Ravensight.resetIdentity() // resets the count
+        Ravensight.identify("u2")
+        settle()
+        assertEquals(3, identifies().size)
+        http.identifyStatus = 503; http.identifyError = "unavailable"
+        nextSession()
+        http.identifyStatus = 400; http.identifyError = "no_session"
+        nextSession()
+        nextSession()
+        assertEquals(6, identifies().size)
+    }
+
     @Test
     fun `before initialize identify refuses and resetIdentity is a no-op`() {
         assertFalse(Ravensight.identify("u1"))
