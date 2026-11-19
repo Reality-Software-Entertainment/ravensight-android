@@ -21,6 +21,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.realityse.ravensight.core.AutoError
 import com.realityse.ravensight.core.BatchOutcome
+import com.realityse.ravensight.core.CampaignLinkState
 import com.realityse.ravensight.core.ErrorCaptureState
 import com.realityse.ravensight.core.ExitReasons
 import com.realityse.ravensight.core.ExitRecord
@@ -95,6 +96,10 @@ object Ravensight {
     /** [setPlaytestContext] called before [initialize]; applied by [initialize]. */
     @Volatile
     private var pendingPlaytest: Pair<String, String?>? = null
+
+    /** A link id passed to [setCampaignLink] before [initialize]; memory only, applied by [initialize]. */
+    @Volatile
+    private var pendingCampaignLink: String? = null
 
     /** True once [initialize] has been called. */
     @JvmStatic
@@ -191,6 +196,8 @@ object Ravensight {
                 pendingPlaytest,
             )
             controller = c
+            pendingCampaignLink?.let { c.setCampaignLink(it) }
+            pendingCampaignLink = null
             c.start(context)
         }
     }
@@ -525,6 +532,37 @@ object Ravensight {
     val isIdentified: Boolean
         get() = safely("isIdentified", false) { controller?.isIdentified ?: false }
 
+    /**
+     * Passes the Ravensight campaign link that brought this player. A
+     * campaign link adds `rs_link=<link id>` to the address it redirects to,
+     * so call this with the `rs_link` value of the App Link, deep link or
+     * install referrer your app already handles. The id goes once, as
+     * `campaignLink`, with the next session the SDK opens for its own player
+     * (best before the first one), and is dropped when that session opens;
+     * a session that fails to open keeps it for the next attempt. Later
+     * sessions carry none unless it is set again. Held in memory only, never
+     * saved, under the same key and consent rules as everything else, and
+     * never sent by a playtest run. Callable before [initialize]: the id is
+     * held for this process.
+     *
+     * Returns true when [id] is a link id (24 hex characters, any case) and
+     * now waits, replacing any earlier one. Anything else, null included,
+     * returns false and leaves a waiting link as it was. Never throws.
+     */
+    @JvmStatic
+    fun setCampaignLink(id: String?): Boolean = safely("setCampaignLink", false) {
+        synchronized(this) {
+            val c = controller
+            if (c != null) {
+                c.setCampaignLink(id)
+            } else {
+                val link = CampaignLinkState.valid(id)
+                if (link != null) pendingCampaignLink = link
+                link != null
+            }
+        }
+    }
+
     internal fun warnIdentifyRefused(reason: String) {
         Log.w(TAG, "identify refused ($reason): pass an opaque account id, 1 to 256 bytes, with no @. Nothing was sent or changed.")
     }
@@ -559,6 +597,7 @@ object Ravensight {
             controller = null
             pendingEnabled = null
             pendingPlaytest = null
+            pendingCampaignLink = null
         }
     }
 
@@ -713,6 +752,9 @@ object Ravensight {
         }
         /** Identify requests run here, off the event worker, so they never delay a batch. */
         private val identifyRunner: (Runnable) -> Unit = deps.identifyRunner ?: { identifyExecutor.value.execute(it) }
+
+        /** The campaign link waiting for the next session (setCampaignLink). Thread safe, memory only. */
+        private val campaignLink = CampaignLinkState()
 
         private val pumpRunnable = Runnable { runSafely("pump") { pump() } }
         private val tickRunnable = Runnable {
@@ -919,6 +961,13 @@ object Ravensight {
             if (!forgetIdentity()) return
             resetDeviceId()
         }
+
+        // --- Campaign link, any thread -------------------------------------------------
+
+        /** True when [id] is a link id and now waits for the next session. */
+        fun setCampaignLink(id: String?): Boolean = campaignLink.set(id)
+
+        internal val campaignLinkPendingForTest: String? get() = campaignLink.pendingLink
 
         /** Drops the identity, and any saved one even while inert. Whether there was one. */
         private fun forgetIdentity(): Boolean {
@@ -1497,6 +1546,9 @@ object Ravensight {
                 .put("sdk", "android/$VERSION")
             distribution?.let { body.put("distribution", it) }
             if (deviceFields.isNotEmpty()) body.put("device", JSONObject(deviceFields as Map<*, *>))
+            // The player's own sessions only, never a playtest run's.
+            val link = campaignLink.forSession(playtest = playtestToken != null)
+            link?.let { body.put("campaignLink", it) }
             val result = transport.request("POST", "$apiUrl/session", headers("X-API-Key" to config.ingestKey), body.toString())
             val json = result.json
             val signing = json?.optJSONObject("signing")?.takeIf { it.optString("algorithm") == "HMAC-SHA256" }
@@ -1512,6 +1564,8 @@ object Ravensight {
                 signingSecret = signing?.optString("secret")?.takeIf { it.isNotEmpty() },
                 serverTimeSec = signing?.optLong("serverTime")?.takeIf { it > 0 },
             )
+            // Dropped only once a session opened (201 with a token).
+            campaignLink.onSessionAnswer(link, opened = outcome is SessionOutcome.Ready)
             when (outcome) {
                 is SessionOutcome.Ready -> {
                     verbose("session ready")
