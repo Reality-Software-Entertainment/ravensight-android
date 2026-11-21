@@ -23,3 +23,17 @@ Experiment keys and variant labels may use those words as string values, matchin
 the server contract. Regression coverage distinguishes those cases. Publishing remains held.
 
 Player Reports: full `:core:test :ravensight:testDebugUnitTest :ravensight:assembleRelease` passes offline on JDK 17. Report tests use native Robolectric graphics and fake API/storage transports; 10 cases cover immutable capture, retry identity, expired sessions, identity/consent changes, malformed images/metadata, bounded polling and Bitmap encoding. Physical device and live storage upload remain unverified. Publishing remains held.
+
+## 0.6.0: identify players who sign in, and campaign links (November 21, 2026)
+
+- Identify (`identify`, `resetIdentity`, `isIdentified`) and `setCampaignLink`
+  together on main at 8afcb7b, built to the platform's identify contract
+  version 2 and the campaign link rules of the JavaScript SDK 0.12.0.
+- `./gradlew :core:test :ravensight:testDebugUnitTest :ravensight:assembleRelease`
+  on JDK 17: core **106 tests**, Robolectric **179 tests**, 0 failures; the
+  release AAR builds.
+- The identify tests read the contract's binding vectors from
+  `core/src/test/resources/identify-vectors.json`, byte for byte the
+  platform's copy.
+- Requests went through a fake transport: no live service, emulator or
+  device was used.
