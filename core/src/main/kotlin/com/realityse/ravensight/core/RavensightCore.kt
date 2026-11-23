@@ -407,6 +407,12 @@ class RavensightCore(
         wantSession = true
     }
 
+    /**
+     * False while a Retry-After, a backoff or a refused key holds sending, so
+     * nothing outside the queue opens a session then.
+     */
+    fun mayOpenSessionNow(): Boolean = !keyRefused && nowMs() >= maxOf(nextAttemptAtMs, retryAfterUntilMs)
+
     /** Forget the current session. The next action will open a fresh one if needed. */
     fun invalidateSession() {
         sessionToken = null

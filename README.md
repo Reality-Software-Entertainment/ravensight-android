@@ -44,7 +44,7 @@ Then add the dependency (`app/build.gradle.kts`):
 
 ```kotlin
 dependencies {
-    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.5.0")
+    implementation("com.github.Reality-Software-Entertainment.ravensight-android:ravensight:v0.6.0")
 }
 ```
 
@@ -130,6 +130,8 @@ blocking, safe from any thread, and never throws.
 | `Ravensight.setTrackingEnabled(context, bool)` | The player's choice, saved across launches. Callable before `initialize`. |
 | `Ravensight.isTrackingEnabled(context)` | The player's saved choice. |
 | `Ravensight.resetDeviceId()` | New random id, saved; clears the queue and ends the session. Returns the new id. `resetDeviceId(context)` also works before `initialize`. |
+| `Ravensight.identify(accountId)` / `resetIdentity()` / `isIdentified` | Links this device to your game's own account after sign-in, and forgets it on sign-out. See "Identify players who sign in". |
+| `Ravensight.setCampaignLink(id)` | Passes the `rs_link` id of the App Link or deep link that brought the player. Returns false for anything but a link id. Callable before `initialize`. See "Campaign links". |
 | `Ravensight.setEnabled(bool)` | The game's own switch, like `RavensightConfig.enabled`. Not saved. Callable before `initialize`. |
 | `Ravensight.statusReason` | Why the SDK is not delivering, or null. See "Status and failures". |
 | `Ravensight.sessionToken` | The current session token, or null until a session opens. |
@@ -530,6 +532,100 @@ Ravensight.setTrackingEnabled(context, true)
 Starting with `enabled = false` and calling `setEnabled(true)` still works,
 but it is not saved, so the game has to remember the answer itself.
 
+## Identify players who sign in
+
+If your game has its own sign-in, tell Ravensight who signed in so one person
+on two devices, or before and after sign-in, counts as one player:
+
+```kotlin
+Ravensight.identify(account.analyticsId)   // after your sign-in succeeds: a random id stored with the account
+Ravensight.resetIdentity()                 // on sign-out
+```
+
+- **What is sent.** Only a hash of the id, keyed with a salt that belongs to
+  your game, and the session token, once per session. The raw id and any
+  email are never sent and never saved. The same account in two games gives
+  two unrelated ids.
+- **Pass a random, high-entropy id**, such as a random UUID
+  (`UUID.randomUUID().toString()`) or a random analytics id you make once for
+  each account and store with it, never a sequential database key, an email,
+  a name or a platform handle. Your game's salt reaches every copy of the
+  game, so anyone could hash 1, 2, 3 and onward and match a guessable id; a
+  random one cannot be guessed. The hash is still a pseudonymous identifier
+  for the player: declare it in your game's privacy notice and your Play data
+  safety answers. `identify` returns false, logs one
+  warning and does nothing for an id that is null, empty, longer than 256
+  UTF-8 bytes or contains `@`. It never throws. The id is used exactly as
+  given, never trimmed.
+- **It lasts.** The hash is saved beside the device id (`ravensight/identity`
+  in `SharedPreferences`, left out of backups by the same rules) and each
+  later session is identified with no call. Calling `identify` again with
+  the same account does nothing.
+- **Sign-out.** `resetIdentity()` forgets the saved identity and switches to
+  a fresh device id, like `resetDeviceId()`, so the next player on this
+  device is not counted as the last one. Identifying a different account
+  does this first on its own. `resetDeviceId()` alone keeps the identity.
+- **Consent.** Without a key, or with `consent = OPT_IN` before the player's
+  yes, the id is held in memory only and nothing is sent.
+  `setTrackingEnabled(context, false)` forgets the identity.
+- **Usage.** Each identified session is one event on your usage. Identify
+  never enters the event queue and runs on its own thread, so it never
+  delays your events. A playtest run never identifies.
+
+Your store privacy form: a game that calls `identify` links Ravensight data
+to the player's account, so declare the data types as linked to the player
+(and a User ID).
+
+## Campaign links
+
+A Ravensight campaign link (`https://go.ravensight.io/...`) that points at
+your own https page adds `rs_link=<link id>` to the address it redirects to.
+When that page opens your app as an App Link, pass the `rs_link` value to
+the SDK. The player and the session are then counted on the Campaign links
+page, by link, and the players it brought open in Player insights.
+
+```kotlin
+// In the Activity your App Link opens: a cold start, and a link that
+// arrives while the app is already open.
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    Ravensight.setCampaignLink(intent?.data?.getQueryParameter("rs_link"))
+}
+
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    Ravensight.setCampaignLink(intent.data?.getQueryParameter("rs_link"))
+}
+```
+
+From Java:
+
+```java
+Uri data = getIntent().getData();
+Ravensight.setCampaignLink(data != null ? data.getQueryParameter("rs_link") : null);
+```
+
+If your app already reads the install referrer, or resolves a deferred deep
+link, and finds an `rs_link` value there, pass that value the same way.
+
+- **Once.** The id goes as `campaignLink` with the next session the SDK
+  opens, so call it as soon as your link handler runs. Before `initialize`
+  is fine: the id is held for this process and goes with the first session.
+  A session that fails to open keeps it for the next attempt; later sessions
+  do not send it unless you call again.
+- **Only a link id.** `setCampaignLink` returns false and changes nothing
+  for anything but 24 hex characters, null included. It never throws. A
+  valid call replaces one still waiting. The server keeps it only when it
+  names a link of the same game, and never refuses or slows a session
+  because of it.
+- **Nothing stored.** The id is held in memory only, never saved. It is one
+  you created, not personal data, and nothing else from the address is read.
+- **Same rules.** Without a key nothing is sent. With `consent = OPT_IN` it
+  waits and goes with the first session after the player's yes. An opted
+  out or stopped player sends nothing, and a playtest run never sends it.
+
+Needs SDK 0.6.0 or later.
+
 ## Telling players
 
 You do not need a permission prompt, but saying what the game sends is good
@@ -561,7 +657,8 @@ the session (turn them off with `sendDeviceInfo = false`):
 
 No GPU name is sent. Country is never sent by the SDK. Each value is
 trimmed, kept to printable characters and cut to 128 characters. Neither
-needs a permission.
+needs a permission. When you call `setCampaignLink`, one session also
+carries that link id (see "Campaign links"); it is never saved.
 
 Android's Auto Backup copies `SharedPreferences` to the player's cloud
 backup by default, which would carry the id to a new phone or across a

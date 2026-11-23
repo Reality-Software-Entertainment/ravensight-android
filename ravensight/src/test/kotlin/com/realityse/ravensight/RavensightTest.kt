@@ -1028,7 +1028,7 @@ class RavensightTest {
 
     @Test
     fun `the version constant is 0_3_0`() {
-        assertEquals("0.5.0", Ravensight.VERSION)
+        assertEquals("0.6.0", Ravensight.VERSION)
     }
 
     // --- 0.3.0 public build rules ------------------------------------------
@@ -1361,6 +1361,11 @@ internal class FakeTransport : RavensightTransport {
     var retryAfter: String? = null
     var throwOn: String? = null
     var failTokenOnce: String? = null
+    /** Sent as the session answer's identify.salt when set. */
+    var identifySalt: String? = null
+    /** The answer to POST /identify. */
+    var identifyStatus = 200
+    var identifyError: String? = null
     private var sessions = 0
 
     fun paths() = requests.map { it.path.substringBefore("?") }
@@ -1378,7 +1383,8 @@ internal class FakeTransport : RavensightTransport {
             }
             "/session" -> if (sessionStatus == 201) {
                 sessions++
-                HttpResult(201, "{\"token\":\"tok_$sessions\",\"expiresIn\":86400}", null)
+                val identify = identifySalt?.let { ",\"identify\":{\"salt\":\"$it\"}" } ?: ""
+                HttpResult(201, "{\"token\":\"tok_$sessions\",\"expiresIn\":86400$identify}", null)
             } else {
                 HttpResult(sessionStatus, "{\"error\":\"${sessionError ?: "nope"}\"}", retryAfter)
             }
@@ -1392,6 +1398,12 @@ internal class FakeTransport : RavensightTransport {
             }
             "/feedback" -> HttpResult(feedbackStatus, if (feedbackStatus == 201) "{}" else "{\"error\":\"invalid_session\"}", null)
             "/agent/suggestions" -> HttpResult(200, "{\"suggestions\":[]}", null)
+            "/identify" -> if (identifyStatus == 200) {
+                HttpResult(200, "{\"playerId\":\"px_test\",\"linked\":true,\"verified\":false,\"repeat\":false}", null)
+            } else {
+                val reason = if (identifyError == "quota_exceeded") ",\"reason\":\"needs_funds\"" else ""
+                HttpResult(identifyStatus, "{\"error\":\"${identifyError ?: "http_$identifyStatus"}\"$reason}", null)
+            }
             else -> HttpResult(404, "", null)
         }
     }

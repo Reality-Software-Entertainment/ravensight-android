@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.github.Reality-Software-Entertainment.ravensight-android"
-version = "0.5.0"
+version = "0.6.0"
 
 android {
     namespace = "com.realityse.ravensight"
@@ -24,6 +24,8 @@ android {
     testOptions {
         unitTests.isIncludeAndroidResources = true
     }
+    // The shared test vectors live once, in core's test resources.
+    sourceSets.getByName("test").resources.srcDir("../core/src/test/resources")
 
     publishing {
         singleVariant("release") {
